@@ -20,6 +20,16 @@ on:
         required: false
         type: boolean
         default: true
+      run_tests:
+        description: Run container structure tests before push.
+        required: false
+        type: boolean
+        default: false
+      test_config:
+        description: Path to container-structure-test config file.
+        required: false
+        type: string
+        default: tests/structure-test.yaml
       dockerfile:
         description: Path to the Dockerfile
         required: false
@@ -40,6 +50,10 @@ on:
         required: false
         type: string
         default: us-east-1
+
+env:
+  TEST_IMAGE: test-image:${{ inputs.image_tag }}
+  CST_VERSION: v2.4.0
 
 jobs:
   build:
@@ -64,12 +78,42 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push
+      - name: Build (load for testing)
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.build_context }}
           file: ${{ inputs.dockerfile }}
-          push: ${{ inputs.push }}
+          load: true
+          push: false
+          tags: ${{ env.TEST_IMAGE }}
+          build-args: ${{ inputs.build_args }}
+          platforms: linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install container-structure-test
+        if: inputs.run_tests
+        run: |
+          curl -fsSLo container-structure-test \
+            https://github.com/GoogleContainerTools/container-structure-test/releases/download/${{ env.CST_VERSION }}/container-structure-test-linux-arm64
+          chmod +x container-structure-test
+          sudo mv container-structure-test /usr/local/bin/container-structure-test
+
+      - name: Run structure tests
+        if: inputs.run_tests
+        run: |
+          container-structure-test test \
+            --image "${{ env.TEST_IMAGE }}" \
+            --config "${{ inputs.test_config }}"
+
+      - name: Push to ECR
+        if: inputs.push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
           tags: ${{ inputs.ecr_repository_url }}:${{ inputs.image_tag }}
           build-args: ${{ inputs.build_args }}
           platforms: linux/arm64
+          cache-from: type=gha
