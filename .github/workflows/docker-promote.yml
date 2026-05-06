@@ -1,0 +1,66 @@
+name: Promote Image to Latest
+
+on:
+  workflow_call:
+    inputs:
+      ecr_repository_url:
+        description: Full ECR repository URL (e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/my-image)
+        required: true
+        type: string
+      role_arn:
+        description: IAM role ARN to assume for ECR operations (OIDC)
+        required: true
+        type: string
+      image_tag:
+        description: Version tag to promote to latest (e.g. v1.1.0)
+        required: true
+        type: string
+      aws_region:
+        description: AWS region for ECR
+        required: false
+        type: string
+        default: us-east-1
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.image_tag }} → latest
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Verify source tag exists
+        run: |
+          REPO_NAME=$(echo "${{ inputs.ecr_repository_url }}" | awk -F'/' '{print $NF}')
+          RESULT=$(aws ecr describe-images \
+            --repository-name "$REPO_NAME" \
+            --image-ids imageTag="${{ inputs.image_tag }}" \
+            --query 'imageDetails[0].imageTags' \
+            --output text 2>&1) || {
+            echo "ERROR: Tag ${{ inputs.image_tag }} not found in $REPO_NAME"
+            exit 1
+          }
+          echo "Found: $RESULT"
+
+      - name: Promote to latest
+        run: |
+          REPO_NAME=$(echo "${{ inputs.ecr_repository_url }}" | awk -F'/' '{print $NF}')
+
+          MANIFEST=$(aws ecr batch-get-image \
+            --repository-name "$REPO_NAME" \
+            --image-ids imageTag="${{ inputs.image_tag }}" \
+            --query 'images[0].imageManifest' \
+            --output text)
+
+          aws ecr put-image \
+            --repository-name "$REPO_NAME" \
+            --image-tag latest \
+            --image-manifest "$MANIFEST"
+
+          echo "✓ Promoted ${{ inputs.image_tag }} → latest in $REPO_NAME"
