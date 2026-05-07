@@ -36,10 +36,20 @@ on:
         type: string
         default: ""
       version_extract_pattern:
-        description: Regex passed to grep -oE to extract the version string from version_extract_command output. Defaults to X.Y.Z semver. Override when the version format differs (e.g. "(?<=release )[^ )]+" for /etc/system-release).
+        description: Regex passed to grep -oE to extract the version string from version_extract_command output. Defaults to X.Y.Z semver.
         required: false
         type: string
         default: "[0-9]+\\.[0-9]+\\.[0-9]+"
+      trivy_scan:
+        description: Run Trivy vulnerability scan after build. Fails the job on HIGH/CRITICAL findings.
+        required: false
+        type: boolean
+        default: false
+      trivy_severity:
+        description: Comma-separated severity levels that fail the build (e.g. HIGH,CRITICAL).
+        required: false
+        type: string
+        default: HIGH,CRITICAL
       dockerfile:
         description: Path to the Dockerfile
         required: false
@@ -76,6 +86,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      security-events: write
     outputs:
       image_tag: ${{ steps.final_tag.outputs.image_tag }}
     steps:
@@ -112,9 +123,9 @@ jobs:
         id: runtime_version
         run: |
           OUTPUT=$(docker run --rm "${{ env.TEST_IMAGE }}" ${{ inputs.version_extract_command }} 2>&1)
-          SEMVER=$(echo "$OUTPUT" | grep -oP '${{ inputs.version_extract_pattern }}' | head -1)
+          SEMVER=$(echo "$OUTPUT" | grep -oE '${{ inputs.version_extract_pattern }}' | head -1 || true)
           if [ -z "$SEMVER" ]; then
-            echo "ERROR: could not extract semver from: $OUTPUT"
+            echo "ERROR: could not extract version from: $OUTPUT"
             exit 1
           fi
           echo "semver=$SEMVER" >> $GITHUB_OUTPUT
@@ -129,6 +140,23 @@ jobs:
             echo "image_tag=${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
           fi
           echo "✓ Final tag: $(cat $GITHUB_OUTPUT | grep image_tag | cut -d= -f2)"
+
+      - name: Scan image with Trivy
+        if: inputs.trivy_scan
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ${{ env.TEST_IMAGE }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "1"
+          severity: ${{ inputs.trivy_severity }}
+          ignore-unfixed: true
+
+      - name: Upload Trivy scan results
+        if: inputs.trivy_scan && !cancelled()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
 
       - name: Install container-structure-test
         if: inputs.run_tests
@@ -156,3 +184,4 @@ jobs:
           build-args: ${{ inputs.build_args }}
           platforms: linux/arm64
           cache-from: type=gha
+          cache-to: type=gha,mode=max
