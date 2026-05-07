@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       image_tag:
-        description: Docker image tag (e.g. release tag or git SHA)
+        description: Release tag (e.g. v26.5.0). Combined with runtime version when version_extract_command is set.
         required: true
         type: string
       push:
@@ -30,6 +30,11 @@ on:
         required: false
         type: string
         default: tests/structure-test.yaml
+      version_extract_command:
+        description: Command to run inside the built image to extract the runtime semver (e.g. "python3 --version"). When set, the pushed tag becomes "<semver>-<image_tag>" (e.g. "3.11.15-v26.5.0").
+        required: false
+        type: string
+        default: ""
       dockerfile:
         description: Path to the Dockerfile
         required: false
@@ -50,6 +55,10 @@ on:
         required: false
         type: string
         default: us-east-1
+    outputs:
+      image_tag:
+        description: The final image tag pushed to ECR (e.g. "3.11.15-v26.5.0" or the raw image_tag if no version extraction).
+        value: ${{ jobs.build.outputs.image_tag }}
 
 env:
   TEST_IMAGE: test-image:${{ inputs.image_tag }}
@@ -62,6 +71,8 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    outputs:
+      image_tag: ${{ steps.final_tag.outputs.image_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -91,6 +102,29 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Extract runtime version
+        if: inputs.version_extract_command != ''
+        id: runtime_version
+        run: |
+          OUTPUT=$(docker run --rm "${{ env.TEST_IMAGE }}" ${{ inputs.version_extract_command }} 2>&1)
+          SEMVER=$(echo "$OUTPUT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          if [ -z "$SEMVER" ]; then
+            echo "ERROR: could not extract semver from: $OUTPUT"
+            exit 1
+          fi
+          echo "semver=$SEMVER" >> $GITHUB_OUTPUT
+          echo "✓ Runtime version: $SEMVER"
+
+      - name: Resolve final image tag
+        id: final_tag
+        run: |
+          if [ -n "${{ steps.runtime_version.outputs.semver }}" ]; then
+            echo "image_tag=${{ steps.runtime_version.outputs.semver }}-${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "image_tag=${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
+          fi
+          echo "✓ Final tag: $(cat $GITHUB_OUTPUT | grep image_tag | cut -d= -f2)"
+
       - name: Install container-structure-test
         if: inputs.run_tests
         run: |
@@ -113,7 +147,7 @@ jobs:
           context: ${{ inputs.build_context }}
           file: ${{ inputs.dockerfile }}
           push: true
-          tags: ${{ inputs.ecr_repository_url }}:${{ inputs.image_tag }}
+          tags: ${{ inputs.ecr_repository_url }}:${{ steps.final_tag.outputs.image_tag }}
           build-args: ${{ inputs.build_args }}
           platforms: linux/arm64
           cache-from: type=gha
