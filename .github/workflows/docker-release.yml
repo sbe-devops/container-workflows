@@ -31,10 +31,15 @@ on:
         type: string
         default: tests/structure-test.yaml
       version_extract_command:
-        description: Command to run inside the built image to extract the runtime semver (e.g. "python3 --version"). When set, the pushed tag becomes "<semver>-<image_tag>" (e.g. "3.11.15-v26.5.0").
+        description: Command to run inside the built image to extract the runtime version (e.g. "python3 --version"). When set, the pushed tag becomes "<version>-<image_tag>" (e.g. "3.11.15-v26.5.0").
         required: false
         type: string
         default: ""
+      version_extract_pattern:
+        description: Regex passed to grep -oE to extract the version string from version_extract_command output. Defaults to X.Y.Z semver. Override when the version format differs (e.g. "(?<=release )[^ )]+" for /etc/system-release).
+        required: false
+        type: string
+        default: "[0-9]+\\.[0-9]+\\.[0-9]+"
       dockerfile:
         description: Path to the Dockerfile
         required: false
@@ -107,7 +112,7 @@ jobs:
         id: runtime_version
         run: |
           OUTPUT=$(docker run --rm "${{ env.TEST_IMAGE }}" ${{ inputs.version_extract_command }} 2>&1)
-          SEMVER=$(echo "$OUTPUT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          SEMVER=$(echo "$OUTPUT" | grep -oP '${{ inputs.version_extract_pattern }}' | head -1)
           if [ -z "$SEMVER" ]; then
             echo "ERROR: could not extract semver from: $OUTPUT"
             exit 1
