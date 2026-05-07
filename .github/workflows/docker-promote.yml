@@ -37,7 +37,7 @@ jobs:
 
       - name: Verify source tag exists
         run: |
-          REPO_NAME=$(echo "${{ inputs.ecr_repository_url }}" | awk -F'/' '{print $NF}')
+          REPO_NAME=$(echo "${{ inputs.ecr_repository_url }}" | cut -d'/' -f2-)
           RESULT=$(aws ecr describe-images \
             --repository-name "$REPO_NAME" \
             --image-ids imageTag="${{ inputs.image_tag }}" \
@@ -50,7 +50,7 @@ jobs:
 
       - name: Promote to latest
         run: |
-          REPO_NAME=$(echo "${{ inputs.ecr_repository_url }}" | awk -F'/' '{print $NF}')
+          REPO_NAME=$(echo "${{ inputs.ecr_repository_url }}" | cut -d'/' -f2-)
 
           MANIFEST=$(aws ecr batch-get-image \
             --repository-name "$REPO_NAME" \
