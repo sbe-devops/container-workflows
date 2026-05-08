@@ -122,7 +122,7 @@ jobs:
         if: inputs.version_extract_command != ''
         id: runtime_version
         run: |
-          OUTPUT=$(docker run --rm "${{ env.TEST_IMAGE }}" ${{ inputs.version_extract_command }} 2>&1)
+          OUTPUT=$(docker run --rm --entrypoint '' "${{ env.TEST_IMAGE }}" ${{ inputs.version_extract_command }} 2>&1)
           SEMVER=$(echo "$OUTPUT" | grep -oE '${{ inputs.version_extract_pattern }}' | head -1 || true)
           if [ -z "$SEMVER" ]; then
             echo "ERROR: could not extract version from: $OUTPUT"
