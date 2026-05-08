@@ -96,8 +96,6 @@ jobs:
     permissions:
       id-token: write
       contents: read
-      security-events: write
-      actions: read
     outputs:
       image_tag: ${{ steps.final_tag.outputs.image_tag }}
     steps:
