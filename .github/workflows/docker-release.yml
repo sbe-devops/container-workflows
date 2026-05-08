@@ -41,7 +41,7 @@ on:
         type: string
         default: "[0-9]+\\.[0-9]+\\.[0-9]+"
       trivy_scan:
-        description: Run Trivy vulnerability scan after build. Fails the job on HIGH/CRITICAL findings.
+        description: Run Trivy vulnerability scan after build. Fails on findings at or above trivy_severity.
         required: false
         type: boolean
         default: false
@@ -50,6 +50,16 @@ on:
         required: false
         type: string
         default: HIGH,CRITICAL
+      sbom:
+        description: Generate a CycloneDX SBOM for the image and attach it as a Cosign attestation after push.
+        required: false
+        type: boolean
+        default: false
+      sign:
+        description: Keyless sign the image with Cosign after push.
+        required: false
+        type: boolean
+        default: false
       dockerfile:
         description: Path to the Dockerfile
         required: false
@@ -141,22 +151,19 @@ jobs:
           fi
           echo "✓ Final tag: $(cat $GITHUB_OUTPUT | grep image_tag | cut -d= -f2)"
 
-      - name: Scan image with Trivy
+      - name: Scan image
         if: inputs.trivy_scan
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: sbe-devops/security-actions/.github/actions/scan@v0.1.0
         with:
           image-ref: ${{ env.TEST_IMAGE }}
-          format: sarif
-          output: trivy-results.sarif
-          exit-code: "1"
           severity: ${{ inputs.trivy_severity }}
-          ignore-unfixed: true
 
-      - name: Upload Trivy scan results
-        if: inputs.trivy_scan && !cancelled() && hashFiles('trivy-results.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v4
+      - name: Generate SBOM
+        if: inputs.sbom
+        id: sbom
+        uses: sbe-devops/security-actions/.github/actions/sbom@v0.1.0
         with:
-          sarif_file: trivy-results.sarif
+          image-ref: ${{ env.TEST_IMAGE }}
 
       - name: Install container-structure-test
         if: inputs.run_tests
@@ -175,6 +182,7 @@ jobs:
 
       - name: Push to ECR
         if: inputs.push
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.build_context }}
@@ -185,3 +193,16 @@ jobs:
           platforms: linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Sign image
+        if: inputs.push && inputs.sign
+        uses: sbe-devops/security-actions/.github/actions/sign@v0.1.0
+        with:
+          image-ref: ${{ inputs.ecr_repository_url }}@${{ steps.push.outputs.digest }}
+
+      - name: Attest SBOM
+        if: inputs.push && inputs.sbom
+        uses: sbe-devops/security-actions/.github/actions/attest@v0.1.0
+        with:
+          image-ref: ${{ inputs.ecr_repository_url }}@${{ steps.push.outputs.digest }}
+          sbom-file: ${{ steps.sbom.outputs.sbom-file }}
