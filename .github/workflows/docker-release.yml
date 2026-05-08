@@ -152,7 +152,7 @@ jobs:
 
       - name: Scan image
         if: inputs.trivy_scan
-        uses: sbe-devops/security-actions/.github/actions/scan@v0.1.0
+        uses: sbe-devops/security-actions/.github/actions/scan@v0.3.0
         with:
           image-ref: ${{ env.TEST_IMAGE }}
           severity: ${{ inputs.trivy_severity }}
