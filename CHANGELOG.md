@@ -10,6 +10,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [s
 
 ---
 
+## [v0.9.6] - 2026-06-22
+
+### Added
+
+- `docker-release.yml`: optional `base_image_role_arn` input — when set, authenticates to a second ECR registry (e.g. a shared SBE account) before the build so Docker can pull cross-account base images. Primary credentials are restored after the base-image login so push still targets the primary registry.
+
+---
+
 ## [v0.9.5] - 2026-06-09
 
 ### Changed
