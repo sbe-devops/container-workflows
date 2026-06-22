@@ -75,7 +75,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.5
+    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.6
     with:
       ecr_repository_url: "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app"
       role_arn: "arn:aws:iam::123456789012:role/github-actions-ecr-push"
@@ -85,6 +85,28 @@ jobs:
       sbom: true
       sign: true
 ```
+
+### Build with cross-account base image (client repos using SBE CSI)
+
+Client repos that build `FROM` a CSI base image hosted in the SBE account use `base_image_role_arn` to authenticate to the SBE registry before the build. The primary `role_arn` still handles push to the client's own ECR.
+
+```yaml
+jobs:
+  build:
+    permissions:
+      id-token: write
+      contents: read
+    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.6
+    with:
+      ecr_repository_url: "111122223333.dkr.ecr.us-east-1.amazonaws.com/my-client-app"
+      role_arn: "arn:aws:iam::111122223333:role/my-app-ecr-push"
+      base_image_role_arn: "arn:aws:iam::112401921630:role/sbe-csi-reader"
+      image_tag: ${{ github.event.release.tag_name }}
+      trivy_scan: true
+      sbom: true
+```
+
+The `sbe-csi-reader` role ARN is stored as a GitHub Actions variable `SBE_CSI_READER_ROLE_ARN` in each consumer org. The role is managed in `sbe-devops/infra` and trusts each registered consumer org via OIDC sub claim.
 
 ### Promote versioned tag to `latest`
 
@@ -103,7 +125,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: sbe-devops/container-workflows/.github/workflows/docker-promote.yml@v0.9.5
+    uses: sbe-devops/container-workflows/.github/workflows/docker-promote.yml@v0.9.6
     with:
       ecr_repository_url: "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app"
       role_arn: "arn:aws:iam::123456789012:role/github-actions-ecr-push"
@@ -127,7 +149,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: sbe-devops/container-workflows/.github/workflows/docker-deploy.yml@v0.9.5
+    uses: sbe-devops/container-workflows/.github/workflows/docker-deploy.yml@v0.9.6
     with:
       role_arn: "arn:aws:iam::123456789012:role/github-actions-deploy"
       ssm_image_tag_param: "/my-project/my-service/image-tag"
@@ -161,6 +183,7 @@ jobs:
 | `build_context` | string | no | `.` | Docker build context path |
 | `build_args` | string | no | `""` | Build arguments, one per line (`KEY=VALUE`) |
 | `aws_region` | string | no | `us-east-1` | AWS region for ECR |
+| `base_image_role_arn` | string | no | `""` | Optional IAM role ARN in a second account to assume before build for cross-account base image pulls. When set, Docker is logged into that ECR registry before the primary registry auth — enabling `FROM` references to images in a different account (e.g. `sbe-csi-reader` for client repos pulling from the SBE shared registry). |
 
 ### `docker-promote.yml`
 
@@ -227,7 +250,7 @@ Per ADR-0003, `trivy_scan`, `sbom`, and `sign` will be enforced as required on a
 This repo follows [semver](https://semver.org/): `vMAJOR.MINOR.PATCH`. Increment MAJOR on breaking input, output, or permission changes; MINOR on backward-compatible additions; PATCH on bug fixes. The repo remains at `v0.x.x` until proven stable across multiple consumers.
 
 ```yaml
-uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.5
+uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.6
 ```
 
 Always pin to a tag — never `@main`. Releases at [sbe-devops/container-workflows/releases](https://github.com/sbe-devops/container-workflows/releases). Cutting procedure and the **fail-forward** rule (never re-release a tag) are documented in [SBE GitHub Actions standards](https://github.com/sbe-devops/standards/blob/main/github-actions.md#versioning).
