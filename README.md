@@ -125,9 +125,8 @@ jobs:
         id: token
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ vars.MY_GH_APP_ID }}
+          client-id: ${{ vars.MY_GH_APP_CLIENT_ID }}
           private-key: ${{ secrets.MY_GH_APP_PRIVATE_KEY }}
-          repositories: my-lib
 
   build:
     needs: setup
