@@ -127,6 +127,7 @@ jobs:
         with:
           client-id: ${{ vars.MY_GH_APP_CLIENT_ID }}
           private-key: ${{ secrets.MY_GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
 
   build:
     needs: setup
