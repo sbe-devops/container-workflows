@@ -95,14 +95,19 @@ on:
         required: false
         type: string
         default: "extra-repo"
+      extra_repo_app_client_id:
+        description: GitHub App client ID used to mint a short-lived installation token for the extra_repo checkout. Pass the public client ID via a repo/org variable (e.g. vars.MY_APP_CLIENT_ID). Pair with extra_repo_app_private_key in the secrets block. Not required for public extra_repo.
+        required: false
+        type: string
+        default: ""
       aws_region:
         description: AWS region for ECR
         required: false
         type: string
         default: us-east-1
     secrets:
-      extra_repo_token:
-        description: Installation token for checking out extra_repo. Generate in the caller via actions/create-github-app-token and pass via secrets (not inputs) so masked values survive the job boundary. Not required for public repos.
+      extra_repo_app_private_key:
+        description: GitHub App private key for the App identified by extra_repo_app_client_id. Used to mint an installation token in-job for the extra_repo checkout. Not required for public extra_repo.
         required: false
     outputs:
       image_tag:
@@ -126,6 +131,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Mint extra_repo token
+        if: inputs.extra_repo != '' && inputs.extra_repo_app_client_id != ''
+        id: extra_repo_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.extra_repo_app_client_id }}
+          private-key: ${{ secrets.extra_repo_app_private_key }}
+          owner: ${{ github.repository_owner }}
+
       - name: Checkout extra repo
         if: inputs.extra_repo != ''
         uses: actions/checkout@v6
@@ -133,7 +147,7 @@ jobs:
           repository: ${{ inputs.extra_repo }}
           ref: ${{ inputs.extra_repo_ref }}
           path: ${{ inputs.extra_repo_path }}
-          token: ${{ secrets.extra_repo_token || github.token }}
+          token: ${{ steps.extra_repo_token.outputs.token || github.token }}
 
       - name: Configure AWS credentials (base image registry)
         if: inputs.base_image_role_arn != ''

@@ -75,7 +75,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.8
+    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.10
     with:
       ecr_repository_url: "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app"
       role_arn: "arn:aws:iam::123456789012:role/github-actions-ecr-push"
@@ -96,7 +96,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.8
+    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.10
     with:
       ecr_repository_url: "111122223333.dkr.ecr.us-east-1.amazonaws.com/my-client-app"
       role_arn: "arn:aws:iam::111122223333:role/my-app-ecr-push"
@@ -112,29 +112,17 @@ The `sbe-csi-reader` role ARN is stored as a GitHub Actions variable `SBE_CSI_RE
 
 When a dependency isn't published to a package index and must be installed from a private repo, use `extra_repo` to check it out into the build context before the Docker build. The checked-out directory is available to `COPY` in the Dockerfile.
 
+For private `extra_repo`s, pass GitHub App credentials and the workflow mints a short-lived installation token in-job. The token never crosses a job boundary, which avoids the GitHub Actions masking-strip issue (`Skip output 'X' since it may contain secret`) that breaks the "mint in a `setup` job, pass via outputs" pattern.
+
+The App must be installed on the org that owns `extra_repo` and granted `contents: read`.
+
 ```yaml
 jobs:
-  setup:
-    runs-on: ubuntu-24.04-arm
-    permissions:
-      contents: read
-    outputs:
-      extra_repo_token: ${{ steps.token.outputs.token }}
-    steps:
-      - name: Generate my-lib token
-        id: token
-        uses: actions/create-github-app-token@v3
-        with:
-          client-id: ${{ vars.MY_GH_APP_CLIENT_ID }}
-          private-key: ${{ secrets.MY_GH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-
   build:
-    needs: setup
     permissions:
       id-token: write
       contents: read
-    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.8
+    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.10
     with:
       ecr_repository_url: "111122223333.dkr.ecr.us-east-1.amazonaws.com/my-app"
       role_arn: "arn:aws:iam::111122223333:role/my-app-ecr-push"
@@ -144,9 +132,14 @@ jobs:
       extra_repo: my-org/my-lib
       extra_repo_ref: v0.1.0
       extra_repo_path: my-lib
+      extra_repo_app_client_id: ${{ vars.MY_GH_APP_CLIENT_ID }}
     secrets:
-      extra_repo_token: ${{ needs.setup.outputs.extra_repo_token }}
+      extra_repo_app_private_key: ${{ secrets.MY_GH_APP_PRIVATE_KEY }}
 ```
+
+No `setup` job, no `needs:`, no token plumbing. The reusable workflow detects a non-empty `extra_repo_app_client_id` and mints the token before the `extra_repo` checkout step.
+
+For public `extra_repo`s, omit the App inputs and the checkout falls back to the workflow's `GITHUB_TOKEN`.
 
 In the Dockerfile, copy the checked-out directory before installing dependencies:
 
@@ -181,7 +174,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: sbe-devops/container-workflows/.github/workflows/docker-promote.yml@v0.9.8
+    uses: sbe-devops/container-workflows/.github/workflows/docker-promote.yml@v0.9.10
     with:
       ecr_repository_url: "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app"
       role_arn: "arn:aws:iam::123456789012:role/github-actions-ecr-push"
@@ -205,7 +198,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: sbe-devops/container-workflows/.github/workflows/docker-deploy.yml@v0.9.8
+    uses: sbe-devops/container-workflows/.github/workflows/docker-deploy.yml@v0.9.10
     with:
       role_arn: "arn:aws:iam::123456789012:role/github-actions-deploy"
       ssm_image_tag_param: "/my-project/my-service/image-tag"
@@ -243,7 +236,8 @@ jobs:
 | `extra_repo` | string | no | `""` | Optional additional repo to check out into the build context before the Docker build (`owner/repo` format). Use when a dependency must be installed from source (e.g. a private library not on PyPI). See `extra_repo_ref`, `extra_repo_path`, and `extra_repo_token`. |
 | `extra_repo_ref` | string | no | `""` | Ref (tag, branch, or SHA) to check out for `extra_repo`. Defaults to the repo's default branch when not set. |
 | `extra_repo_path` | string | no | `"extra-repo"` | Path within the workspace to check out `extra_repo` into. Defaults to `extra-repo`. This directory is included in the Docker build context, so `COPY extra_repo_path /dest` works in the Dockerfile. |
-| `extra_repo_token` | secret | no | — | Installation token for authenticating the `extra_repo` checkout. Must be passed via `secrets:` (not `with:`), as masked values do not survive the job boundary through `inputs`. Generate in a caller `setup` job via `actions/create-github-app-token@v3` and forward with `secrets: extra_repo_token: ${{ needs.setup.outputs.extra_repo_token }}`. Not required for public repos. |
+| `extra_repo_app_client_id` | string | no | `""` | GitHub App client ID used to mint a short-lived installation token for the `extra_repo` checkout. Pass the public client ID via a repo/org variable (e.g. `vars.MY_APP_CLIENT_ID`). Pair with `extra_repo_app_private_key` in the `secrets:` block. Omit for public `extra_repo`s — checkout falls back to the workflow's `GITHUB_TOKEN`. |
+| `extra_repo_app_private_key` | secret | no | — | GitHub App private key for the App identified by `extra_repo_app_client_id`. Must be passed via the `secrets:` block. The token is minted inside the build job (same job that uses it) — this avoids the `Skip output 'X' since it may contain secret` masking strip that breaks cross-job token passing. |
 
 ### `docker-promote.yml`
 
@@ -310,7 +304,7 @@ Per ADR-0003, `trivy_scan`, `sbom`, and `sign` will be enforced as required on a
 This repo follows [semver](https://semver.org/): `vMAJOR.MINOR.PATCH`. Increment MAJOR on breaking input, output, or permission changes; MINOR on backward-compatible additions; PATCH on bug fixes. The repo remains at `v0.x.x` until proven stable across multiple consumers.
 
 ```yaml
-uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.8
+uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.10
 ```
 
 Always pin to a tag — never `@main`. Releases at [sbe-devops/container-workflows/releases](https://github.com/sbe-devops/container-workflows/releases). Cutting procedure and the **fail-forward** rule (never re-release a tag) are documented in [SBE GitHub Actions standards](https://github.com/sbe-devops/standards/blob/main/github-actions.md#versioning).
