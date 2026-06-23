@@ -80,6 +80,21 @@ on:
         required: false
         type: string
         default: ""
+      extra_repo:
+        description: Optional additional repo to check out into the build context before the Docker build (owner/repo format, e.g. my-org/my-lib). Use with extra_repo_ref and extra_repo_path.
+        required: false
+        type: string
+        default: ""
+      extra_repo_ref:
+        description: Ref (tag, branch, or SHA) to check out for extra_repo. Defaults to the repo's default branch when not set.
+        required: false
+        type: string
+        default: ""
+      extra_repo_path:
+        description: Path within the workspace to check out extra_repo into. Defaults to "extra-repo". This directory will be included in the Docker build context.
+        required: false
+        type: string
+        default: "extra-repo"
       aws_region:
         description: AWS region for ECR
         required: false
@@ -106,6 +121,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Checkout extra repo
+        if: inputs.extra_repo != ''
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.extra_repo }}
+          ref: ${{ inputs.extra_repo_ref }}
+          path: ${{ inputs.extra_repo_path }}
 
       - name: Configure AWS credentials (base image registry)
         if: inputs.base_image_role_arn != ''
