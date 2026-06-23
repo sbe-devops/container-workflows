@@ -95,16 +95,15 @@ on:
         required: false
         type: string
         default: "extra-repo"
-      extra_repo_token:
-        description: Installation token for checking out extra_repo. Generate in the caller job using actions/create-github-app-token and pass the output here. Not required for public repos.
-        required: false
-        type: string
-        default: ""
       aws_region:
         description: AWS region for ECR
         required: false
         type: string
         default: us-east-1
+    secrets:
+      extra_repo_token:
+        description: Installation token for checking out extra_repo. Generate in the caller via actions/create-github-app-token and pass via secrets (not inputs) so masked values survive the job boundary. Not required for public repos.
+        required: false
     outputs:
       image_tag:
         description: The final image tag pushed to ECR (e.g. "3.11.15-v26.5.0" or the raw image_tag if no version extraction).
@@ -134,7 +133,7 @@ jobs:
           repository: ${{ inputs.extra_repo }}
           ref: ${{ inputs.extra_repo_ref }}
           path: ${{ inputs.extra_repo_path }}
-          token: ${{ inputs.extra_repo_token || github.token }}
+          token: ${{ secrets.extra_repo_token || github.token }}
 
       - name: Configure AWS credentials (base image registry)
         if: inputs.base_image_role_arn != ''

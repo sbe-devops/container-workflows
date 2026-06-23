@@ -144,6 +144,7 @@ jobs:
       extra_repo: my-org/my-lib
       extra_repo_ref: v0.1.0
       extra_repo_path: my-lib
+    secrets:
       extra_repo_token: ${{ needs.setup.outputs.extra_repo_token }}
 ```
 
@@ -242,7 +243,7 @@ jobs:
 | `extra_repo` | string | no | `""` | Optional additional repo to check out into the build context before the Docker build (`owner/repo` format). Use when a dependency must be installed from source (e.g. a private library not on PyPI). See `extra_repo_ref`, `extra_repo_path`, and `extra_repo_token`. |
 | `extra_repo_ref` | string | no | `""` | Ref (tag, branch, or SHA) to check out for `extra_repo`. Defaults to the repo's default branch when not set. |
 | `extra_repo_path` | string | no | `"extra-repo"` | Path within the workspace to check out `extra_repo` into. Defaults to `extra-repo`. This directory is included in the Docker build context, so `COPY extra_repo_path /dest` works in the Dockerfile. |
-| `extra_repo_token` | string | no | `""` | Installation token for authenticating the `extra_repo` checkout. GitHub App tokens must be generated in the caller before invoking this workflow (use `actions/create-github-app-token@v3`) and passed here via `needs.<setup-job>.outputs.token`. Not required for public repos. |
+| `extra_repo_token` | secret | no | — | Installation token for authenticating the `extra_repo` checkout. Must be passed via `secrets:` (not `with:`), as masked values do not survive the job boundary through `inputs`. Generate in a caller `setup` job via `actions/create-github-app-token@v3` and forward with `secrets: extra_repo_token: ${{ needs.setup.outputs.extra_repo_token }}`. Not required for public repos. |
 
 ### `docker-promote.yml`
 
