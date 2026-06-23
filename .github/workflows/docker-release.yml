@@ -95,6 +95,11 @@ on:
         required: false
         type: string
         default: "extra-repo"
+      extra_repo_token:
+        description: Installation token for checking out extra_repo. Generate in the caller job using actions/create-github-app-token and pass the output here. Not required for public repos.
+        required: false
+        type: string
+        default: ""
       aws_region:
         description: AWS region for ECR
         required: false
@@ -129,6 +134,7 @@ jobs:
           repository: ${{ inputs.extra_repo }}
           ref: ${{ inputs.extra_repo_ref }}
           path: ${{ inputs.extra_repo_path }}
+          token: ${{ inputs.extra_repo_token || github.token }}
 
       - name: Configure AWS credentials (base image registry)
         if: inputs.base_image_role_arn != ''
