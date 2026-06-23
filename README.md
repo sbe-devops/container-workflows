@@ -75,7 +75,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.6
+    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.7
     with:
       ecr_repository_url: "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app"
       role_arn: "arn:aws:iam::123456789012:role/github-actions-ecr-push"
@@ -96,7 +96,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.6
+    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.7
     with:
       ecr_repository_url: "111122223333.dkr.ecr.us-east-1.amazonaws.com/my-client-app"
       role_arn: "arn:aws:iam::111122223333:role/my-app-ecr-push"
@@ -107,6 +107,44 @@ jobs:
 ```
 
 The `sbe-csi-reader` role ARN is stored as a GitHub Actions variable `SBE_CSI_READER_ROLE_ARN` in each consumer org. The role is managed in `sbe-devops/infra` and trusts each registered consumer org via OIDC sub claim.
+
+### Build with a private library checked out from source
+
+When a dependency isn't published to a package index and must be installed from a private repo, use `extra_repo` to check it out into the build context before the Docker build. The checked-out directory is available to `COPY` in the Dockerfile.
+
+```yaml
+jobs:
+  build:
+    permissions:
+      id-token: write
+      contents: read
+    uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.7
+    with:
+      ecr_repository_url: "111122223333.dkr.ecr.us-east-1.amazonaws.com/my-app"
+      role_arn: "arn:aws:iam::111122223333:role/my-app-ecr-push"
+      base_image_role_arn: "arn:aws:iam::112401921630:role/sbe-csi-reader"
+      image_tag: ${{ github.event.release.tag_name }}
+      trivy_scan: true
+      extra_repo: my-org/my-lib
+      extra_repo_ref: v0.1.0
+      extra_repo_path: my-lib
+```
+
+In the Dockerfile, copy the checked-out directory before installing dependencies:
+
+```dockerfile
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY requirements.txt /tmp/requirements.txt
+COPY my-lib /tmp/my-lib
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
+```
+
+In `requirements.txt`, reference the local path:
+
+```
+my-lib @ file:///tmp/my-lib
+```
 
 ### Promote versioned tag to `latest`
 
@@ -125,7 +163,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: sbe-devops/container-workflows/.github/workflows/docker-promote.yml@v0.9.6
+    uses: sbe-devops/container-workflows/.github/workflows/docker-promote.yml@v0.9.7
     with:
       ecr_repository_url: "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app"
       role_arn: "arn:aws:iam::123456789012:role/github-actions-ecr-push"
@@ -149,7 +187,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: sbe-devops/container-workflows/.github/workflows/docker-deploy.yml@v0.9.6
+    uses: sbe-devops/container-workflows/.github/workflows/docker-deploy.yml@v0.9.7
     with:
       role_arn: "arn:aws:iam::123456789012:role/github-actions-deploy"
       ssm_image_tag_param: "/my-project/my-service/image-tag"
@@ -184,6 +222,9 @@ jobs:
 | `build_args` | string | no | `""` | Build arguments, one per line (`KEY=VALUE`) |
 | `aws_region` | string | no | `us-east-1` | AWS region for ECR |
 | `base_image_role_arn` | string | no | `""` | Optional IAM role ARN in a second account to assume before build for cross-account base image pulls. When set, Docker is logged into that ECR registry before the primary registry auth — enabling `FROM` references to images in a different account (e.g. `sbe-csi-reader` for client repos pulling from the SBE shared registry). |
+| `extra_repo` | string | no | `""` | Optional additional repo to check out into the build context before the Docker build (`owner/repo` format). Use when a dependency must be installed from source (e.g. a private library not on PyPI). See `extra_repo_ref` and `extra_repo_path`. |
+| `extra_repo_ref` | string | no | `""` | Ref (tag, branch, or SHA) to check out for `extra_repo`. Defaults to the repo's default branch when not set. |
+| `extra_repo_path` | string | no | `"extra-repo"` | Path within the workspace to check out `extra_repo` into. Defaults to `extra-repo`. This directory is included in the Docker build context, so `COPY extra_repo_path /dest` works in the Dockerfile. |
 
 ### `docker-promote.yml`
 
@@ -250,10 +291,16 @@ Per ADR-0003, `trivy_scan`, `sbom`, and `sign` will be enforced as required on a
 This repo follows [semver](https://semver.org/): `vMAJOR.MINOR.PATCH`. Increment MAJOR on breaking input, output, or permission changes; MINOR on backward-compatible additions; PATCH on bug fixes. The repo remains at `v0.x.x` until proven stable across multiple consumers.
 
 ```yaml
-uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.6
+uses: sbe-devops/container-workflows/.github/workflows/docker-release.yml@v0.9.7
 ```
 
 Always pin to a tag — never `@main`. Releases at [sbe-devops/container-workflows/releases](https://github.com/sbe-devops/container-workflows/releases). Cutting procedure and the **fail-forward** rule (never re-release a tag) are documented in [SBE GitHub Actions standards](https://github.com/sbe-devops/standards/blob/main/github-actions.md#versioning).
+
+**Cutting a release** — use `gh release create`, which creates both the tag and the GitHub Release in one step:
+
+```bash
+gh release create vX.Y.Z --title "vX.Y.Z" --notes "..."
+```
 
 ---
 
