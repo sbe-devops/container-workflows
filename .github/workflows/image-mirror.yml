@@ -1,0 +1,217 @@
+name: Image Mirror
+
+# Mirror a third-party image into an SBE ECR registry, running the same security gamut as
+# docker-release.yml (scan -> SBOM -> sign -> attest) — minus the build, since the image is
+# already published upstream.
+#
+# Copy mechanism: `crane copy` (registry-to-registry). NOT `docker pull` + `docker push` —
+# a docker pull resolves only the RUNNER's platform, so re-pushing would silently publish a
+# single-arch image and break mixed-architecture clusters. crane copies the whole manifest
+# list (all architectures) and never needs a local daemon or a full layer download.
+#
+# The upstream image is scanned BEFORE the copy, so a failing image never lands in the registry.
+
+on:
+  workflow_call:
+    inputs:
+      source_image:
+        description: Full upstream image reference including tag (e.g. quay.io/jetstack/cert-manager-controller:v1.16.2).
+        required: true
+        type: string
+      ecr_repository_url:
+        description: Full destination ECR repository URL (e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/jetstack/cert-manager-controller).
+        required: true
+        type: string
+      role_arn:
+        description: >-
+          IAM role ARN to assume for ECR authentication (OIDC). Required only when push is
+          true — scan-only runs need no cloud access at all.
+        required: false
+        type: string
+        default: ""
+      image_tag:
+        description: Destination tag. Defaults to the tag on source_image — mirrors should preserve the upstream tag.
+        required: false
+        type: string
+        default: ""
+      push:
+        description: Copy the image after scanning. Set false for PR verification (scan only).
+        required: false
+        type: boolean
+        default: true
+      trivy_scan:
+        description: Scan the upstream image before copying. Fails at or above trivy_severity.
+        required: false
+        type: boolean
+        default: true
+      trivy_severity:
+        description: Comma-separated severity levels that fail the mirror (e.g. HIGH,CRITICAL).
+        required: false
+        type: string
+        default: HIGH,CRITICAL
+      ignore_unfixed:
+        description: >-
+          Ignore CVEs with no upstream fix. Default true: these are third-party images we do
+          not build, so an unfixable CVE blocks the mirror without offering a remedy — and
+          staying on an older image is usually worse. Set false to gate on everything.
+        required: false
+        type: string
+        default: "true"
+      scan_exit_code:
+        description: >-
+          Exit code when the scan finds qualifying vulnerabilities. "1" = gate (default).
+          "0" = report-only — the findings are printed but do not block, for components you
+          want to observe without blocking, or when a waiver decision is pending.
+        required: false
+        type: string
+        default: "1"
+      sbom:
+        description: Generate a CycloneDX SBOM and attach it as a Cosign attestation after the copy.
+        required: false
+        type: boolean
+        default: false
+      sign:
+        description: Keyless sign the mirrored image with Cosign after the copy.
+        required: false
+        type: boolean
+        default: false
+      crane_version:
+        description: go-containerregistry (crane) release to pin.
+        required: false
+        type: string
+        default: v0.20.6
+      aws_region:
+        description: AWS region for ECR.
+        required: false
+        type: string
+        default: us-east-1
+    outputs:
+      image_ref:
+        description: The mirrored image reference (repository:tag).
+        value: ${{ jobs.mirror.outputs.image_ref }}
+      digest:
+        description: Digest of the mirrored image (the manifest list digest).
+        value: ${{ jobs.mirror.outputs.digest }}
+
+jobs:
+  mirror:
+    name: ${{ inputs.push && 'Scan and Mirror' || 'Scan' }}
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_ref: ${{ steps.target.outputs.image_ref }}
+      digest: ${{ steps.copy.outputs.digest }}
+    steps:
+      - name: Resolve destination tag
+        id: target
+        env:
+          SOURCE_IMAGE: ${{ inputs.source_image }}
+          ECR_REPOSITORY_URL: ${{ inputs.ecr_repository_url }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          tag="$IMAGE_TAG"
+          if [ -z "$tag" ]; then
+            # Take the tag after the last ':' — but only if it's a tag, not a registry port.
+            case "${SOURCE_IMAGE##*/}" in
+              *:*) tag="${SOURCE_IMAGE##*:}" ;;
+              *)   echo "::error::source_image has no tag and image_tag was not set: $SOURCE_IMAGE"; exit 1 ;;
+            esac
+          fi
+          {
+            echo "tag=$tag"
+            echo "image_ref=${ECR_REPOSITORY_URL}:${tag}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Mirroring ${SOURCE_IMAGE} -> ${ECR_REPOSITORY_URL}:${tag}"
+
+      # Scan the UPSTREAM image first — a failing image must never reach the registry.
+      - name: Scan upstream image
+        if: inputs.trivy_scan
+        uses: sbe-devops/security-actions/.github/actions/scan@v0.3.0
+        with:
+          image-ref: ${{ inputs.source_image }}
+          severity: ${{ inputs.trivy_severity }}
+          ignore-unfixed: ${{ inputs.ignore_unfixed }}
+          exit-code: ${{ inputs.scan_exit_code }}
+
+      - name: Check push credentials
+        if: inputs.push
+        env:
+          ROLE_ARN: ${{ inputs.role_arn }}
+        run: |
+          set -euo pipefail
+          [ -n "$ROLE_ARN" ] || { echo "::error::push is true but role_arn was not provided"; exit 1; }
+
+      # AWS + crane are copy-time only. A scan-only run (push: false) touches no cloud.
+      - name: Configure AWS credentials
+        if: inputs.push
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to ECR
+        if: inputs.push
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install crane
+        if: inputs.push
+        env:
+          CRANE_VERSION: ${{ inputs.crane_version }}
+        run: |
+          set -euo pipefail
+          # Single static binary from the official release — no daemon, no full layer pull.
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_arm64.tar.gz" -o /tmp/crane.tgz
+          tar -xzf /tmp/crane.tgz -C /tmp crane
+          sudo install -m 0755 /tmp/crane /usr/local/bin/crane
+          crane version
+
+      - name: Copy image (all platforms)
+        if: inputs.push
+        id: copy
+        env:
+          SOURCE_IMAGE: ${{ inputs.source_image }}
+          TARGET_REF: ${{ steps.target.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          # crane copy preserves the full manifest list — every architecture, same digests.
+          crane copy "$SOURCE_IMAGE" "$TARGET_REF"
+          digest="$(crane digest "$TARGET_REF")"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "✓ Mirrored ${SOURCE_IMAGE} -> ${TARGET_REF} (${digest})"
+          {
+            echo "### Image mirrored"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| upstream | \`${SOURCE_IMAGE}\` |"
+            echo "| mirror | \`${TARGET_REF}\` |"
+            echo "| digest | \`${digest}\` |"
+            echo ""
+            echo "Platforms:"
+            echo '```'
+            crane manifest "$TARGET_REF" | jq -r '(.manifests // [])[] | "\(.platform.os)/\(.platform.architecture)"' || echo "(single-platform image)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate SBOM
+        if: inputs.push && inputs.sbom
+        id: sbom
+        uses: sbe-devops/security-actions/.github/actions/sbom@v0.1.0
+        with:
+          image-ref: ${{ steps.target.outputs.image_ref }}
+
+      - name: Sign image
+        if: inputs.push && inputs.sign
+        uses: sbe-devops/security-actions/.github/actions/sign@v0.1.0
+        with:
+          image-ref: ${{ inputs.ecr_repository_url }}@${{ steps.copy.outputs.digest }}
+
+      - name: Attest SBOM
+        if: inputs.push && inputs.sbom
+        uses: sbe-devops/security-actions/.github/actions/attest@v0.1.0
+        with:
+          image-ref: ${{ inputs.ecr_repository_url }}@${{ steps.copy.outputs.digest }}
+          sbom-file: ${{ steps.sbom.outputs.sbom-file }}

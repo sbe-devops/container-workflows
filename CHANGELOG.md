@@ -8,6 +8,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [s
 
 ## [Unreleased]
 
+### Added
+
+- **`image-mirror.yml`** — mirror a third-party image into ECR with the same security gamut as
+  `docker-release.yml` (scan → SBOM → sign → attest), minus the build. Uses **`crane copy`** so
+  the full multi-arch manifest list is preserved (`docker pull`/`push` would silently publish a
+  single-arch image); scans the **upstream** image *before* copying so a failing image never
+  reaches the registry; preserves the upstream tag by default.
+
 ---
 
 ## [v0.9.6] - 2026-06-22
