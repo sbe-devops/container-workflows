@@ -57,6 +57,14 @@ on:
         required: false
         type: string
         default: "true"
+      scan_exit_code:
+        description: >-
+          Exit code when the scan finds qualifying vulnerabilities. "1" = gate (default).
+          "0" = report-only — the findings are printed but do not block, for components you
+          want to observe without blocking, or when a waiver decision is pending.
+        required: false
+        type: string
+        default: "1"
       sbom:
         description: Generate a CycloneDX SBOM and attach it as a Cosign attestation after the copy.
         required: false
@@ -126,6 +134,7 @@ jobs:
           image-ref: ${{ inputs.source_image }}
           severity: ${{ inputs.trivy_severity }}
           ignore-unfixed: ${{ inputs.ignore_unfixed }}
+          exit-code: ${{ inputs.scan_exit_code }}
 
       - name: Check push credentials
         if: inputs.push
