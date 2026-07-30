@@ -31,6 +31,18 @@ Use `docker-release.yml` as the release trigger in any image repo. Trigger it on
 
 ---
 
+### `image-mirror.yml` — Mirror a third-party image into ECR
+
+Copies an already-published upstream image (quay.io, ghcr.io, registry.k8s.io, public.ecr.aws…)
+into an SBE ECR registry, running the same security gamut as `docker-release.yml` — **scan →
+SBOM → sign → attest** — minus the build.
+
+- **`crane copy`, not `docker pull`/`push`.** A `docker pull` resolves only the runner's
+  platform, so re-pushing silently publishes a **single-arch** image and breaks mixed-arch
+  clusters. `crane` copies the whole manifest list, with no daemon and no full layer download.
+- **Scans the upstream image *before* copying**, so a failing image never reaches the registry.
+- **Preserves the upstream tag by default** (`image_tag` overrides).
+
 ### `docker-promote.yml` — Promote versioned tag to `latest`
 
 Re-tags an existing immutable image in ECR as `latest` using `ecr batch-get-image` + `put-image`. This is the only mechanism that moves `latest`. `latest` is never auto-updated on release — promotion is an explicit, separate step.
@@ -157,6 +169,28 @@ In `requirements.txt`, reference the local path:
 my-lib @ file:///tmp/my-lib
 ```
 
+### Mirror a third-party image into ECR
+
+```yaml
+jobs:
+  mirror:
+    permissions:
+      id-token: write
+      contents: read
+    uses: sbe-devops/container-workflows/.github/workflows/image-mirror.yml@v0.10.0
+    with:
+      source_image: quay.io/jetstack/cert-manager-controller:v1.16.2
+      ecr_repository_url: 112401921630.dkr.ecr.us-east-1.amazonaws.com/jetstack/cert-manager-controller
+      role_arn: arn:aws:iam::112401921630:role/eks-image-mirror-ecr-push
+      trivy_severity: HIGH,CRITICAL
+      sbom: true
+      sign: true
+```
+
+The destination path is the upstream path **with the registry host dropped** — the SBE
+convention (registries churn, the path is stable). Set `push: false` on PRs to scan without
+copying.
+
 ### Promote versioned tag to `latest`
 
 ```yaml
@@ -239,6 +273,21 @@ jobs:
 | `extra_repo_app_client_id` | string | no | `""` | GitHub App client ID used to mint a short-lived installation token for the `extra_repo` checkout. Pass the public client ID via a repo/org variable (e.g. `vars.MY_APP_CLIENT_ID`). Pair with `extra_repo_app_private_key` in the `secrets:` block. Omit for public `extra_repo`s — checkout falls back to the workflow's `GITHUB_TOKEN`. |
 | `extra_repo_app_private_key` | secret | no | — | GitHub App private key for the App identified by `extra_repo_app_client_id`. Must be passed via the `secrets:` block. The token is minted inside the build job (same job that uses it) — this avoids the `Skip output 'X' since it may contain secret` masking strip that breaks cross-job token passing. |
 
+### `image-mirror.yml`
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `source_image` | yes | — | Full upstream ref incl. tag (e.g. `quay.io/jetstack/cert-manager-controller:v1.16.2`) |
+| `ecr_repository_url` | yes | — | Destination ECR repository URL |
+| `role_arn` | yes | — | IAM role to assume for ECR (OIDC) |
+| `image_tag` | no | *(upstream tag)* | Destination tag override |
+| `push` | no | `true` | Copy after scanning; `false` = scan only |
+| `trivy_scan` | no | `true` | Scan the upstream image before copying |
+| `trivy_severity` | no | `HIGH,CRITICAL` | Severities that fail the mirror |
+| `sbom` / `sign` | no | `false` | SBOM attestation / keyless Cosign signature |
+| `crane_version` | no | `v0.20.6` | Pinned go-containerregistry release |
+| `aws_region` | no | `us-east-1` | ECR region |
+
 ### `docker-promote.yml`
 
 | Input | Type | Required | Default | Description |
@@ -263,6 +312,13 @@ jobs:
 ---
 
 ## Outputs
+
+### `image-mirror.yml`
+
+| Output | Description |
+|---|---|
+| `image_ref` | The mirrored reference (`repository:tag`) |
+| `digest` | Digest of the mirrored image (the manifest-list digest) |
 
 ### `docker-release.yml`
 
