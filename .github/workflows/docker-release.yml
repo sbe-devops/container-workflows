@@ -210,7 +210,7 @@ jobs:
 
       - name: Scan image
         if: inputs.trivy_scan
-        uses: sbe-devops/security-actions/.github/actions/scan@v0.3.0
+        uses: sbe-devops/security-actions/.github/actions/scan@v0.4.0
         with:
           image-ref: ${{ env.TEST_IMAGE }}
           severity: ${{ inputs.trivy_severity }}
@@ -218,7 +218,7 @@ jobs:
       - name: Generate SBOM
         if: inputs.sbom
         id: sbom
-        uses: sbe-devops/security-actions/.github/actions/sbom@v0.1.0
+        uses: sbe-devops/security-actions/.github/actions/sbom@v0.4.0
         with:
           image-ref: ${{ env.TEST_IMAGE }}
 
@@ -253,13 +253,13 @@ jobs:
 
       - name: Sign image
         if: inputs.push && inputs.sign
-        uses: sbe-devops/security-actions/.github/actions/sign@v0.1.0
+        uses: sbe-devops/security-actions/.github/actions/sign@v0.4.0
         with:
           image-ref: ${{ inputs.ecr_repository_url }}@${{ steps.push.outputs.digest }}
 
       - name: Attest SBOM
         if: inputs.push && inputs.sbom
-        uses: sbe-devops/security-actions/.github/actions/attest@v0.1.0
+        uses: sbe-devops/security-actions/.github/actions/attest@v0.4.0
         with:
           image-ref: ${{ inputs.ecr_repository_url }}@${{ steps.push.outputs.digest }}
           sbom-file: ${{ steps.sbom.outputs.sbom-file }}
