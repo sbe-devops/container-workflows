@@ -8,6 +8,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [s
 
 ## [Unreleased]
 
+### Changed
+
+- Pin all four `security-actions` composite actions to **`@v0.4.0`**. They live in a single
+  repo with a single tag series, but were pinned at two different versions — `scan@v0.3.0`
+  while `sbom`/`sign`/`attest` sat at `@v0.1.0`, i.e. two tag generations behind. `scan@v0.4.0`
+  also brings the vendor `trivy-action` (arch resolution + vulnerability-DB caching).
+
 ### Added
 
 - **`image-mirror.yml`** — mirror a third-party image into ECR with the same security gamut as

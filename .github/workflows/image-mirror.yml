@@ -129,7 +129,7 @@ jobs:
       # Scan the UPSTREAM image first — a failing image must never reach the registry.
       - name: Scan upstream image
         if: inputs.trivy_scan
-        uses: sbe-devops/security-actions/.github/actions/scan@v0.3.0
+        uses: sbe-devops/security-actions/.github/actions/scan@v0.4.0
         with:
           image-ref: ${{ inputs.source_image }}
           severity: ${{ inputs.trivy_severity }}
@@ -199,19 +199,19 @@ jobs:
       - name: Generate SBOM
         if: inputs.push && inputs.sbom
         id: sbom
-        uses: sbe-devops/security-actions/.github/actions/sbom@v0.1.0
+        uses: sbe-devops/security-actions/.github/actions/sbom@v0.4.0
         with:
           image-ref: ${{ steps.target.outputs.image_ref }}
 
       - name: Sign image
         if: inputs.push && inputs.sign
-        uses: sbe-devops/security-actions/.github/actions/sign@v0.1.0
+        uses: sbe-devops/security-actions/.github/actions/sign@v0.4.0
         with:
           image-ref: ${{ inputs.ecr_repository_url }}@${{ steps.copy.outputs.digest }}
 
       - name: Attest SBOM
         if: inputs.push && inputs.sbom
-        uses: sbe-devops/security-actions/.github/actions/attest@v0.1.0
+        uses: sbe-devops/security-actions/.github/actions/attest@v0.4.0
         with:
           image-ref: ${{ inputs.ecr_repository_url }}@${{ steps.copy.outputs.digest }}
           sbom-file: ${{ steps.sbom.outputs.sbom-file }}
