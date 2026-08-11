@@ -1,9 +1,19 @@
-name-template: "$NEXT_PATCH_VERSION"
-tag-template: "$NEXT_PATCH_VERSION"
+name-template: "v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
 
-# CalVer: vYY.M.N — year and month are set manually at publish time.
-# Release Drafter increments N (the patch component) automatically.
-# When a new month starts, edit the tag to vYY.M.0 before publishing.
+# SemVer per standards/github-actions.md — matching this repo's actual tags
+# (v0.9.10 -> v0.10.0 -> v0.10.1 -> v0.10.2).
+#
+# This file previously said "CalVer: vYY.M.N, year and month set manually at
+# publish time" and used `$NEXT_PATCH_VERSION` for both templates. Three problems,
+# all of which bit:
+#   - it described a scheme this repo has never used (v0.10.2 is not year 0, month 10)
+#   - `$NEXT_PATCH_VERSION` emits NO leading "v", so every draft had to be hand-
+#     corrected at publish time — four times and counting
+#   - it hardcoded a patch bump, so the version-resolver below was dead config
+#
+# Release Drafter resolves the version from PR LABELS, which is why the autolabeler
+# at the bottom exists. Without it every PR falls through to `default: patch`.
 
 categories:
   - title: "💥 Breaking Changes"
@@ -20,18 +30,39 @@ categories:
 change-template: "- $TITLE @$AUTHOR (#$NUMBER)"
 change-title-escapes: '\<*_&'
 
+# ⚠️ PRE-1.0 MAPPING — a breaking change bumps the MINOR, not the major.
+# 0.10.2 -> 0.11.0, never 1.0.0. `major:` is deliberately absent: leaving it as
+# ["breaking"] meant one labelled PR could silently draft v1.0.0, declaring this
+# repo stable as a side effect of labelling.
+#
+# AT v1.0.0: move "breaking" from `minor:` into a new `major:` block.
 version-resolver:
-  major:
-    labels: ["breaking"]
   minor:
-    labels: ["feature", "enhancement"]
+    labels: ["breaking", "feature", "enhancement"]
   patch:
     labels: ["bug", "fix", "build", "ci", "dockerfile", "maintenance", "chore", "dependencies"]
   default: patch
+
+# Labels come from the PR TITLE, which we already write as conventional commits, so
+# the version resolves without anyone remembering to label. `!` anywhere in the
+# type/scope marks a breaking change (feat!:, fix(api)!:) and is matched first.
+autolabeler:
+  - label: "breaking"
+    title: '/^[a-z]+(\(.+\))?!:/'
+  - label: "feature"
+    title: '/^feat(\(.+\))?:/'
+  - label: "fix"
+    title: '/^fix(\(.+\))?:/'
+  - label: "ci"
+    title: '/^(ci|build)(\(.+\))?:/'
+  - label: "maintenance"
+    title: '/^(chore|refactor|docs|test|style|perf)(\(.+\))?:/'
+  - label: "dependencies"
+    title: '/^deps(\(.+\))?:/'
 
 template: |
   ## What's Changed
 
   $CHANGES
 
-  **Full Changelog**: $PREVIOUS_TAG...https://github.com/sbe-devops/container-workflows/compare/$PREVIOUS_TAG...$RESOLVED_VERSION
+  **Full Changelog**: https://github.com/sbe-devops/container-workflows/compare/$PREVIOUS_TAG...$RESOLVED_VERSION
