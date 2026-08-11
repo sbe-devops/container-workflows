@@ -156,17 +156,30 @@ jobs:
         if: inputs.push
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Install crane
+      # `crane_version` is a PUBLIC workflow_call input whose default has always
+      # carried a leading "v" ("v0.20.6"), but gh-setup-crane takes a bare version.
+      # Normalising here rather than redefining the input keeps this adoption
+      # NON-breaking: callers already passing "v0.21.8" keep working, and "0.21.8"
+      # works too. See the HANDOFFS note — helm-kustomize@v0.4.0 went the other way
+      # (strict, breaking) and unifying the two is an open call.
+      - name: Normalize crane version
         if: inputs.push
+        id: crane_version
         env:
           CRANE_VERSION: ${{ inputs.crane_version }}
         run: |
           set -euo pipefail
-          # Single static binary from the official release — no daemon, no full layer pull.
-          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_arm64.tar.gz" -o /tmp/crane.tgz
-          tar -xzf /tmp/crane.tgz -C /tmp crane
-          sudo install -m 0755 /tmp/crane /usr/local/bin/crane
-          crane version
+          echo "version=${CRANE_VERSION#v}" >> "$GITHUB_OUTPUT"
+
+      # Was an inline `curl` + `tar` of the release archive — verified by nothing and
+      # invisible to Renovate. gh-setup-crane checks the archive against the project's
+      # published checksums and fails closed (standards/github-actions.md, "Installing
+      # tools in workflows"). crane ships no vendor setup action, so tier 3 applies.
+      - name: Set up crane
+        if: inputs.push
+        uses: sbe-devops/gh-setup-crane@v0.1.0
+        with:
+          version: ${{ steps.crane_version.outputs.version }}
 
       - name: Copy image (all platforms)
         if: inputs.push

@@ -116,7 +116,10 @@ on:
 
 env:
   TEST_IMAGE: test-image:${{ inputs.image_tag }}
-  CST_VERSION: v1.22.1
+  # No leading "v" — gh-setup-container-structure-test takes a bare version and
+  # builds the tag itself. This is an internal env, not a workflow_call input, so
+  # dropping the prefix changes nothing for callers.
+  CST_VERSION: 1.22.1
 
 jobs:
   build:
@@ -222,13 +225,17 @@ jobs:
         with:
           image-ref: ${{ env.TEST_IMAGE }}
 
-      - name: Install container-structure-test
+      # Was an inline `curl` of the release binary — verified by nothing, invisible
+      # to Renovate, and the same install duplicated across repos. Now a tier-3 SBE
+      # gh-setup-<tool> action that checks the download against the project's
+      # published checksums and fails closed (standards/github-actions.md,
+      # "Installing tools in workflows"). container-structure-test ships no vendor
+      # setup action, so tier 3 is the correct rung here, not a shortcut.
+      - name: Set up container-structure-test
         if: inputs.run_tests
-        run: |
-          curl -fsSLo container-structure-test \
-            https://github.com/GoogleContainerTools/container-structure-test/releases/download/${{ env.CST_VERSION }}/container-structure-test-linux-arm64
-          chmod +x container-structure-test
-          sudo mv container-structure-test /usr/local/bin/container-structure-test
+        uses: sbe-devops/gh-setup-container-structure-test@v0.1.0
+        with:
+          version: ${{ env.CST_VERSION }}
 
       - name: Run structure tests
         if: inputs.run_tests
