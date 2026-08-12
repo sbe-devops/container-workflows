@@ -125,6 +125,9 @@ jobs:
   build:
     name: ${{ inputs.push && 'Build and Push' || 'Build' }}
     runs-on: ubuntu-24.04-arm
+    # Hang protection, not a budget — build + Trivy scan + SBOM + structure tests + push + sign + attest; observed max 3 min.
+    # Without this a stuck job runs to GitHub's 360-minute default.
+    timeout-minutes: 30
     permissions:
       id-token: write
       contents: read

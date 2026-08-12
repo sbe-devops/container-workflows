@@ -97,6 +97,9 @@ jobs:
   mirror:
     name: ${{ inputs.push && 'Scan and Mirror' || 'Scan' }}
     runs-on: ubuntu-24.04-arm
+    # Hang protection, not a budget — crane copy of a full multi-arch manifest list; size varies with the upstream image.
+    # Without this a stuck job runs to GitHub's 360-minute default.
+    timeout-minutes: 30
     permissions:
       id-token: write
       contents: read
