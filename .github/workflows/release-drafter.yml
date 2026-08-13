@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, edited]   # NOT synchronize — it fires per push and the title is unchanged
 
 permissions:
   contents: read
