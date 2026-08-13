@@ -46,23 +46,32 @@ version-resolver:
 # Labels come from the PR TITLE, which we already write as conventional commits, so
 # the version resolves without anyone remembering to label. `!` anywhere in the
 # type/scope marks a breaking change (feat!:, fix(api)!:) and is matched first.
+# VERIFY AFTER MERGE: open the next PR with a conventional-commit title and confirm the
+# label lands. `title` MUST be a LIST — a scalar parses fine and silently matches nothing,
+# which is exactly how this shipped broken in v0.10.3 (2026-08-12).
 autolabeler:
   - label: "breaking"
-    title: '/^[a-z]+(\(.+\))?!:/'
+    title:
+      - '/^[a-z]+(\(.+\))?!:/'
   - label: "feature"
-    title: '/^feat(\(.+\))?:/'
+    title:
+      - '/^feat(\(.+\))?:/'
   - label: "fix"
-    title: '/^fix(\(.+\))?:/'
+    title:
+      - '/^fix(\(.+\))?:/'
   - label: "ci"
-    title: '/^(ci|build)(\(.+\))?:/'
+    title:
+      - '/^(ci|build)(\(.+\))?:/'
   - label: "maintenance"
-    title: '/^(chore|refactor|docs|test|style|perf)(\(.+\))?:/'
+    title:
+      - '/^(chore|refactor|docs|test|style|perf)(\(.+\))?:/'
   - label: "dependencies"
-    title: '/^deps(\(.+\))?:/'
+    title:
+      - '/^deps(\(.+\))?:/'
 
 template: |
   ## What's Changed
 
   $CHANGES
 
-  **Full Changelog**: https://github.com/sbe-devops/container-workflows/compare/$PREVIOUS_TAG...$RESOLVED_VERSION
+  **Full Changelog**: https://github.com/sbe-devops/container-workflows/compare/$PREVIOUS_TAG...v$RESOLVED_VERSION
