@@ -1,7 +1,8 @@
 name: Docker Deploy
 
 # Deploy a Docker-on-EC2 service by writing DESIRED state and waiting for the
-# instance to converge. CI never executes anything on the box.
+# instance to publish OBSERVED state matching it. CI never executes anything on
+# the box.
 #
 # ⚠️ WHY THERE IS NO `ssm:SendCommand` HERE — do not "simplify" this back.
 # A deploy role holding SendCommand on AWS-RunShellScript holds arbitrary root
@@ -10,24 +11,24 @@ name: Docker Deploy
 # role itself is not permitted to read. That is a four-step escalation whose last
 # three steps are automatic, reachable by anything able to trigger this workflow.
 #
-# So CD writes desired state and reads observed state. Nothing else:
-#   ssm:PutParameter  /<service>/image-tag         <- desired
-#   ssm:PutParameter  /<service>/running-version   <- invalidate only, see below
-#   ssm:GetParameter  /<service>/running-version   <- observed
+# The CD role needs exactly two actions:
+#   ssm:PutParameter  <ssm_image_tag_param>       desired
+#   ssm:GetParameter  <ssm_running_image_param>   observed
 #
-# The instance converges on its own (tf-aws-ec2-docker's poll timer) and writes
-# back the tag it is ACTUALLY running. Same shape as the WireGuard hub's SSM
-# poll, and philosophically the same as the EKS lane: CI writes intent, the
-# target converges.
+# No SendCommand. No ec2:DescribeInstances. No shell. No instance lookup — which
+# also removes the whole class of "the deploy targeted the wrong box, or nothing"
+# tag-filter bugs.
 #
-# 🔗 Requires tf-aws-ec2-docker with the convergence timer + write-back.
-#    Without it, running-version never advances and every deploy times out.
+# 🔗 REQUIRES tf-aws-ec2-docker >= the convergence release, with
+#    `ssm_running_image_param` set and `converge_interval_seconds` > 0.
+#    Without the timer nothing publishes observed state and every deploy times
+#    out — correctly, because nothing has been proven.
 
 on:
   workflow_call:
     inputs:
       role_arn:
-        description: IAM role ARN to assume (OIDC). Needs only the three SSM parameter actions above.
+        description: IAM role ARN to assume (OIDC). Needs only the two SSM actions above.
         required: true
         type: string
       aws_region:
@@ -39,12 +40,12 @@ on:
         description: SSM parameter holding the DESIRED image tag (e.g. /lorem/image-tag).
         required: true
         type: string
-      ssm_running_version_param:
+      ssm_running_image_param:
         description: >-
-          SSM parameter the instance writes with the tag it is ACTUALLY running
-          (e.g. /lorem/running-version). Written by tf-aws-ec2-docker's
-          ExecStartPost from `docker inspect` — not echoed from the desired
-          parameter, or it would prove nothing.
+          SSM parameter the instance publishes OBSERVED state to, as JSON:
+          {tag, image, digest, instance_id, observed_at, healthy}. Read from
+          `docker inspect` by tf-aws-ec2-docker's converge script — deliberately
+          not an echo of the desired tag. Module output: `running_image_param`.
         required: true
         type: string
       image_tag:
@@ -56,37 +57,45 @@ on:
         type: string
       poll_timeout_seconds:
         description: >-
-          How long to wait for the instance to converge. Must exceed the module's
-          poll interval + image pull + container start. Default 300.
+          How long to wait for convergence. Must exceed the module's
+          converge_interval_seconds + image pull + container start. Default 300.
         required: false
         type: number
         default: 300
       poll_interval_seconds:
-        description: Seconds between reads of the running-version parameter.
+        description: Seconds between reads of the observed-state parameter.
         required: false
         type: number
         default: 10
     outputs:
-      running_version:
-        description: The tag observed running after convergence.
-        value: ${{ jobs.deploy.outputs.running_version }}
+      running_image:
+        description: Full image ref observed running after convergence.
+        value: ${{ jobs.deploy.outputs.running_image }}
+      running_digest:
+        description: Image digest observed running. Tags are mutable; this is the real identity.
+        value: ${{ jobs.deploy.outputs.running_digest }}
+      instance_id:
+        description: The instance that reported convergence.
+        value: ${{ jobs.deploy.outputs.instance_id }}
       converged_after_seconds:
         description: Seconds from writing desired state to observing convergence.
-        value: ${{ jobs.deploy.outputs.converged_after_seconds }}
+        value: ${{ jobs.deploy.outputs.elapsed }}
 
 jobs:
   deploy:
     name: Deploy
     runs-on: ubuntu-24.04-arm
     # Hang protection, not a budget. Must exceed poll_timeout_seconds so the
-    # poll's own error message wins over an opaque job kill.
+    # poll's own diagnostic wins over an opaque job kill.
     timeout-minutes: 15
     permissions:
       id-token: write
       contents: read
     outputs:
-      running_version: ${{ steps.converge.outputs.running_version }}
-      converged_after_seconds: ${{ steps.converge.outputs.elapsed }}
+      running_image: ${{ steps.converge.outputs.running_image }}
+      running_digest: ${{ steps.converge.outputs.running_digest }}
+      instance_id: ${{ steps.converge.outputs.instance_id }}
+      elapsed: ${{ steps.converge.outputs.elapsed }}
 
     steps:
       - name: Configure AWS credentials
@@ -95,22 +104,30 @@ jobs:
           role-to-assume: ${{ inputs.role_arn }}
           aws-region: ${{ inputs.aws_region }}
 
-      # ⚠️ THIS STEP IS THE POINT. Without it, redeploying the SAME tag passes
-      # instantly: running-version already equals image_tag from last time, so
-      # the poll returns on its first read having proven nothing — a green
-      # deploy over an untouched instance, which is the exact failure class this
-      # workflow exists to remove.
+      # Captured BEFORE writing desired state. Convergence later requires
+      # observed_at to have CHANGED from this value.
       #
-      # Invalidating first means convergence is only ever reported when the
-      # INSTANCE writes the value back.
-      - name: Invalidate observed state
+      # ⚠️ This is what stops a same-tag redeploy passing instantly. Without it,
+      # re-releasing a tag the instance is already running matches on the first
+      # read, having proven nothing — a green deploy over an untouched box, which
+      # is the exact failure class this workflow exists to remove.
+      #
+      # Comparing "changed" rather than "newer than now" is deliberate: the
+      # instance's clock and the runner's are unrelated, and a skewed instance
+      # would make a timestamp comparison either falsely converge or never
+      # converge. The converge timer rewrites this parameter every interval, so
+      # "it changed" is a sound freshness proof and needs no shared clock.
+      - name: Capture prior observed state
+        id: prior
         env:
-          RUNNING_PARAM: ${{ inputs.ssm_running_version_param }}
+          RUNNING_PARAM: ${{ inputs.ssm_running_image_param }}
         run: |
           set -euo pipefail
-          aws ssm put-parameter --name "$RUNNING_PARAM" \
-            --value "pending" --type String --overwrite
-          echo "Invalidated $RUNNING_PARAM — convergence must now be written by the instance"
+          prior=$(aws ssm get-parameter --name "$RUNNING_PARAM" \
+            --query Parameter.Value --output text 2>/dev/null || echo "")
+          prior_at=$(jq -r '.observed_at // ""' <<<"${prior:-{\}}" 2>/dev/null || echo "")
+          echo "prior_observed_at=$prior_at" >> "$GITHUB_OUTPUT"
+          echo "Prior observed_at: ${prior_at:-<none>}"
 
       - name: Write desired image tag
         env:
@@ -124,53 +141,88 @@ jobs:
       - name: Wait for the instance to converge
         id: converge
         env:
-          RUNNING_PARAM: ${{ inputs.ssm_running_version_param }}
+          RUNNING_PARAM: ${{ inputs.ssm_running_image_param }}
           TAG: ${{ inputs.image_tag }}
           TIMEOUT: ${{ inputs.poll_timeout_seconds }}
           INTERVAL: ${{ inputs.poll_interval_seconds }}
+          PRIOR_AT: ${{ steps.prior.outputs.prior_observed_at }}
         run: |
           set -euo pipefail
           start=$SECONDS
           deadline=$(( start + TIMEOUT ))
-          last=""
+          last_summary=""
+          last_state="{}"
 
           while [ "$SECONDS" -lt "$deadline" ]; do
-            # ParameterNotFound is expected on a first-ever deploy — treat as unset.
-            observed=$(aws ssm get-parameter --name "$RUNNING_PARAM" \
+            raw=$(aws ssm get-parameter --name "$RUNNING_PARAM" \
               --query Parameter.Value --output text 2>/dev/null || echo "")
 
-            # Whole-value equality. NOT a regex match: `grep ":$TAG$"` treats the
-            # tag as a pattern, so semver dots match any character and an image
-            # tagged v1X2X3 would satisfy ":v1.2.3$".
-            if [ "$observed" = "$TAG" ]; then
-              elapsed=$(( SECONDS - start ))
-              {
-                echo "running_version=$observed"
-                echo "elapsed=$elapsed"
-              } >> "$GITHUB_OUTPUT"
-              echo "Converged in ${elapsed}s — instance reports it is running $TAG"
-              {
-                echo "### Deployed \`${TAG}\`"
-                echo ""
-                echo "- converged in **${elapsed}s**"
-                echo "- \`${RUNNING_PARAM}\` = \`${observed}\`"
-                echo ""
-                echo "_CI wrote desired state and observed convergence. It executed nothing on the instance._"
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
+            if [ -n "$raw" ] && jq -e . >/dev/null 2>&1 <<<"$raw"; then
+              last_state="$raw"
+              obs_tag=$(jq -r '.tag // ""'         <<<"$raw")
+              healthy=$(jq -r '.healthy // false'  <<<"$raw")
+              obs_at=$(jq -r  '.observed_at // ""' <<<"$raw")
+              desired=$(jq -r '.desired // ""'     <<<"$raw")
+
+              # All three must hold. Tag alone is not convergence: the instance
+              # may be reporting a stale success from before this deploy, or be
+              # up on the right tag but unhealthy.
+              if [ "$healthy" = "true" ] && [ "$obs_tag" = "$TAG" ] && [ "$obs_at" != "$PRIOR_AT" ]; then
+                elapsed=$(( SECONDS - start ))
+                {
+                  echo "running_image=$(jq -r '.image // ""' <<<"$raw")"
+                  echo "running_digest=$(jq -r '.digest // ""' <<<"$raw")"
+                  echo "instance_id=$(jq -r '.instance_id // ""' <<<"$raw")"
+                  echo "elapsed=$elapsed"
+                } >> "$GITHUB_OUTPUT"
+                echo "Converged in ${elapsed}s"
+                {
+                  echo "### Deployed \`${TAG}\`"
+                  echo ""
+                  echo "| | |"
+                  echo "|---|---|"
+                  echo "| converged in | **${elapsed}s** |"
+                  echo "| image | \`$(jq -r '.image' <<<"$raw")\` |"
+                  echo "| digest | \`$(jq -r '.digest' <<<"$raw")\` |"
+                  echo "| instance | \`$(jq -r '.instance_id' <<<"$raw")\` |"
+                  echo "| observed at | \`${obs_at}\` |"
+                  echo ""
+                  echo "_CI wrote desired state and observed convergence. It executed nothing on the instance._"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+
+              summary="healthy=$healthy tag='${obs_tag}' observed_at=${obs_at}"
+              [ "$healthy" = "false" ] && summary="$summary (unit not up; it wanted '${desired}')"
+            else
+              summary="no observed state published yet"
             fi
 
-            if [ "$observed" != "$last" ]; then
-              echo "  observed: ${observed:-<unset>} (want $TAG, ${SECONDS}s elapsed)"
-              last="$observed"
+            if [ "$summary" != "$last_summary" ]; then
+              echo "  ${SECONDS}s: $summary"
+              last_summary="$summary"
             fi
             sleep "$INTERVAL"
           done
 
-          echo "::error::Instance did not converge on $TAG within ${TIMEOUT}s."
-          echo "::error::Last observed ${RUNNING_PARAM}=${last:-<unset>}"
-          echo "::error::The container is NOT confirmed running $TAG. Check, in order:"
-          echo "::error::  1. the poll timer on the instance — systemctl status <service>-watch.timer"
-          echo "::error::  2. the unit failed to start on the new image — journalctl -u <service>"
-          echo "::error::  3. image_tag does not match the tag actually pushed to ECR"
+          # Diagnose by WHY, not just "timed out".
+          obs_tag=$(jq -r '.tag // ""'        <<<"$last_state")
+          healthy=$(jq -r '.healthy // false' <<<"$last_state")
+          obs_at=$(jq -r  '.observed_at // ""' <<<"$last_state")
+
+          echo "::error::Instance did not converge on ${TAG} within ${TIMEOUT}s."
+          echo "::error::Last observed state: ${last_state}"
+          if [ "$last_state" = "{}" ] || [ -z "$obs_at" ]; then
+            echo "::error::Nothing was ever published. Check ssm_running_image_param is set on the module,"
+            echo "::error::and converge_interval_seconds > 0 — with the timer off, nothing converges."
+          elif [ "$obs_at" = "$PRIOR_AT" ]; then
+            echo "::error::observed_at never changed — the converge timer is not running."
+            echo "::error::  systemctl status <container>-converge.timer"
+          elif [ "$healthy" != "true" ]; then
+            echo "::error::The instance reported UNHEALTHY — it pulled the tag but the unit did not come up."
+            echo "::error::  journalctl -u <service>   (this is an application failure, not a delivery one)"
+          else
+            echo "::error::Converging on '${obs_tag}', not '${TAG}'. Usually image_tag does not match the"
+            echo "::error::tag actually pushed to ECR — pass needs.build.outputs.image_tag."
+          fi
           exit 1
