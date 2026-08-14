@@ -19,10 +19,15 @@ name: Docker Deploy
 # also removes the whole class of "the deploy targeted the wrong box, or nothing"
 # tag-filter bugs.
 #
-# 🔗 REQUIRES tf-aws-ec2-docker >= the convergence release, with
-#    `ssm_running_image_param` set and `converge_interval_seconds` > 0.
-#    Without the timer nothing publishes observed state and every deploy times
-#    out — correctly, because nothing has been proven.
+# 🔗 REQUIRES tf-aws-ec2-docker >= v0.4.0, with `ssm_running_image_param` set
+#    and `converge_interval_seconds` > 0. Without the timer nothing publishes
+#    observed state and every deploy times out — correctly, because nothing has
+#    been proven.
+#
+#    ⚠️ Do NOT pin v0.3.17. It is a DRAFT release with no git tag —
+#    `refs/tags/v0.3.17` returns 404, so `?ref=v0.3.17` cannot resolve and
+#    `terraform init` fails. It appears between v0.3.16 and v0.4.0 in the
+#    release list and looks real. Use v0.4.0.
 
 on:
   workflow_call:
