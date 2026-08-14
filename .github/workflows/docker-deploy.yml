@@ -1,8 +1,8 @@
 name: Docker Deploy
 
-# Deploy a Docker-on-EC2 service: write the image tag to SSM, restart the
-# systemd unit, and VERIFY the container is actually running the tag that was
-# just deployed.
+# Deploy a Docker-on-EC2 service: write the image tag to SSM, optionally run
+# migrations against the new image, restart the systemd unit, and VERIFY the
+# container is actually running the tag that was just deployed.
 #
 # ⚠️ WHY THE VERIFY STEPS EXIST — do not remove them to "simplify" this.
 # `aws ssm send-command` is FIRE-AND-FORGET. It returns success the moment the
@@ -70,6 +70,26 @@ on:
         required: false
         type: string
         default: ""
+      image_repository:
+        description: >-
+          Optional ECR repository URL (no tag). When set, the migration command
+          gets `$IMAGE` as the full `<repo>:<tag>` ref — what you need to
+          `docker run` the new image. Without it only `$IMAGE_TAG` is available.
+        required: false
+        type: string
+        default: ""
+      migration_command:
+        description: >-
+          Optional shell command run ON THE INSTANCE before the restart, with the
+          new image already pulled. `$IMAGE_TAG` is always exported; `$IMAGE` is
+          the full ref when `image_repository` is set.
+          Runs AFTER the SSM tag write and BEFORE the restart, deliberately: the
+          schema catches up before the code that depends on it goes live, and the
+          old container stays serving until the restart. Failure aborts the deploy
+          without restarting.
+        required: false
+        type: string
+        default: ""
       restart_wait_seconds:
         description: Seconds to wait after restart before asserting the unit is active.
         required: false
@@ -87,9 +107,9 @@ jobs:
   deploy:
     name: Deploy
     runs-on: ubuntu-24.04-arm
-    # Hang protection, not a budget — deploy path; observed max 3 min.
-    # Without this a stuck job runs to GitHub's 360-minute default.
-    timeout-minutes: 20
+    # Hang protection, not a budget. Raised from 20 to 30 when migrations were
+    # added — a migration runs inside this job's wall clock.
+    timeout-minutes: 30
     permissions:
       id-token: write
       contents: read
@@ -104,8 +124,8 @@ jobs:
           role-to-assume: ${{ inputs.role_arn }}
           aws-region: ${{ inputs.aws_region }}
 
-      # Resolved once into a step output rather than inline in the restart
-      # step — so every later step provably targets the same instance.
+      # Resolved once and reused, so migrations and restart cannot target
+      # different instances if something changes mid-run.
       - name: Resolve target instance
         id: target
         env:
@@ -135,6 +155,38 @@ jobs:
           aws ssm put-parameter --name "$PARAM" --value "$TAG" --type String --overwrite
           echo "SSM $PARAM → $TAG"
 
+      # Runs against the NEW image while the OLD container is still serving.
+      - name: Run migrations
+        if: inputs.migration_command != ''
+        env:
+          INSTANCE_ID: ${{ steps.target.outputs.instance_id }}
+          MIGRATION_COMMAND: ${{ inputs.migration_command }}
+          TAG: ${{ inputs.image_tag }}
+          REPO: ${{ inputs.image_repository }}
+        run: |
+          set -euo pipefail
+          # Built via env + jq -Rs so the caller's command is never interpolated
+          # into this script — no quoting surprises, no injection.
+          printf '%s\n' \
+            'set -eux' \
+            "IMAGE_TAG=\"$TAG\"" \
+            "IMAGE=\"${REPO:+$REPO:}$TAG\"" \
+            "$MIGRATION_COMMAND" > /tmp/migrate.sh
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" --document-name "AWS-RunShellScript" \
+            --comment "migrate $TAG" \
+            --parameters "$(jq -Rs '{commands: [.]}' < /tmp/migrate.sh)" \
+            --query 'Command.CommandId' --output text)
+
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" || true
+          INV=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID")
+          echo "--- migration stdout ---"; jq -r '.StandardOutputContent' <<<"$INV"
+          echo "--- migration stderr ---"; jq -r '.StandardErrorContent'  <<<"$INV"
+          [ "$(jq -r '.Status' <<<"$INV")" = "Success" ] || {
+            echo "::error::Migrations FAILED on $INSTANCE_ID — NOT restarting. The old container is still serving."
+            exit 1; }
+          echo "Migrations applied for $TAG"
 
       - name: Restart and verify
         id: verify
