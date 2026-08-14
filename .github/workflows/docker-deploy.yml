@@ -1,10 +1,33 @@
 name: Docker Deploy
 
+# Deploy a Docker-on-EC2 service by writing DESIRED state and waiting for the
+# instance to converge. CI never executes anything on the box.
+#
+# ⚠️ WHY THERE IS NO `ssm:SendCommand` HERE — do not "simplify" this back.
+# A deploy role holding SendCommand on AWS-RunShellScript holds arbitrary root
+# execution on the instance. Root there inherits the instance profile, which can
+# read the whole `/<service>/*` parameter tree — including parameters the deploy
+# role itself is not permitted to read. That is a four-step escalation whose last
+# three steps are automatic, reachable by anything able to trigger this workflow.
+#
+# So CD writes desired state and reads observed state. Nothing else:
+#   ssm:PutParameter  /<service>/image-tag         <- desired
+#   ssm:PutParameter  /<service>/running-version   <- invalidate only, see below
+#   ssm:GetParameter  /<service>/running-version   <- observed
+#
+# The instance converges on its own (tf-aws-ec2-docker's poll timer) and writes
+# back the tag it is ACTUALLY running. Same shape as the WireGuard hub's SSM
+# poll, and philosophically the same as the EKS lane: CI writes intent, the
+# target converges.
+#
+# 🔗 Requires tf-aws-ec2-docker with the convergence timer + write-back.
+#    Without it, running-version never advances and every deploy times out.
+
 on:
   workflow_call:
     inputs:
       role_arn:
-        description: IAM role ARN to assume for deployment (OIDC)
+        description: IAM role ARN to assume (OIDC). Needs only the three SSM parameter actions above.
         required: true
         type: string
       aws_region:
@@ -13,67 +36,141 @@ on:
         type: string
         default: us-east-1
       ssm_image_tag_param:
-        description: SSM Parameter Store path to write the image tag (e.g. /moby-trading/kraken/image-tag)
+        description: SSM parameter holding the DESIRED image tag (e.g. /lorem/image-tag).
+        required: true
+        type: string
+      ssm_running_version_param:
+        description: >-
+          SSM parameter the instance writes with the tag it is ACTUALLY running
+          (e.g. /lorem/running-version). Written by tf-aws-ec2-docker's
+          ExecStartPost from `docker inspect` — not echoed from the desired
+          parameter, or it would prove nothing.
         required: true
         type: string
       image_tag:
-        description: Image tag to deploy (e.g. v0.3.1)
+        description: >-
+          Tag to deploy. Must be the tag ACTUALLY PUSHED — if the build used
+          version_extract_command, pass `needs.build.outputs.image_tag`, not the
+          raw release tag, or convergence will correctly never happen.
         required: true
         type: string
-      ec2_instance_tag_key:
-        description: EC2 tag key used to find the target instance (e.g. Project)
-        required: true
-        type: string
-      ec2_instance_tag_value:
-        description: EC2 tag value used to find the target instance (e.g. moby-trading)
-        required: true
-        type: string
-      service_name:
-        description: systemd service name to restart on the EC2 instance
-        required: true
-        type: string
+      poll_timeout_seconds:
+        description: >-
+          How long to wait for the instance to converge. Must exceed the module's
+          poll interval + image pull + container start. Default 300.
+        required: false
+        type: number
+        default: 300
+      poll_interval_seconds:
+        description: Seconds between reads of the running-version parameter.
+        required: false
+        type: number
+        default: 10
+    outputs:
+      running_version:
+        description: The tag observed running after convergence.
+        value: ${{ jobs.deploy.outputs.running_version }}
+      converged_after_seconds:
+        description: Seconds from writing desired state to observing convergence.
+        value: ${{ jobs.deploy.outputs.converged_after_seconds }}
 
 jobs:
   deploy:
     name: Deploy
     runs-on: ubuntu-24.04-arm
-    # Hang protection, not a budget — deploy path; observed max 3 min.
-    # Without this a stuck job runs to GitHub's 360-minute default.
-    timeout-minutes: 20
+    # Hang protection, not a budget. Must exceed poll_timeout_seconds so the
+    # poll's own error message wins over an opaque job kill.
+    timeout-minutes: 15
     permissions:
       id-token: write
       contents: read
+    outputs:
+      running_version: ${{ steps.converge.outputs.running_version }}
+      converged_after_seconds: ${{ steps.converge.outputs.elapsed }}
 
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ inputs.role_arn }}
           aws-region: ${{ inputs.aws_region }}
 
-      - name: Update image tag in SSM
+      # ⚠️ THIS STEP IS THE POINT. Without it, redeploying the SAME tag passes
+      # instantly: running-version already equals image_tag from last time, so
+      # the poll returns on its first read having proven nothing — a green
+      # deploy over an untouched instance, which is the exact failure class this
+      # workflow exists to remove.
+      #
+      # Invalidating first means convergence is only ever reported when the
+      # INSTANCE writes the value back.
+      - name: Invalidate observed state
+        env:
+          RUNNING_PARAM: ${{ inputs.ssm_running_version_param }}
         run: |
-          aws ssm put-parameter \
-            --name "${{ inputs.ssm_image_tag_param }}" \
-            --value "${{ inputs.image_tag }}" \
-            --type String \
-            --overwrite
-          echo "SSM ${{ inputs.ssm_image_tag_param }} → ${{ inputs.image_tag }}"
+          set -euo pipefail
+          aws ssm put-parameter --name "$RUNNING_PARAM" \
+            --value "pending" --type String --overwrite
+          echo "Invalidated $RUNNING_PARAM — convergence must now be written by the instance"
 
-      - name: Restart service on EC2
+      - name: Write desired image tag
+        env:
+          PARAM: ${{ inputs.ssm_image_tag_param }}
+          TAG: ${{ inputs.image_tag }}
         run: |
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters \
-              "Name=tag:${{ inputs.ec2_instance_tag_key }},Values=${{ inputs.ec2_instance_tag_value }}" \
-              "Name=instance-state-name,Values=running" \
-            --query 'Reservations[0].Instances[0].InstanceId' \
-            --output text)
-          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "No running instance found for tag ${{ inputs.ec2_instance_tag_key }}=${{ inputs.ec2_instance_tag_value }}"
-            exit 1
-          fi
-          aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters "commands=[\"systemctl restart ${{ inputs.service_name }}\"]"
-          echo "Deployed ${{ inputs.image_tag }} → $INSTANCE_ID (service: ${{ inputs.service_name }})"
+          set -euo pipefail
+          aws ssm put-parameter --name "$PARAM" --value "$TAG" --type String --overwrite
+          echo "Desired: $PARAM -> $TAG"
+
+      - name: Wait for the instance to converge
+        id: converge
+        env:
+          RUNNING_PARAM: ${{ inputs.ssm_running_version_param }}
+          TAG: ${{ inputs.image_tag }}
+          TIMEOUT: ${{ inputs.poll_timeout_seconds }}
+          INTERVAL: ${{ inputs.poll_interval_seconds }}
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          deadline=$(( start + TIMEOUT ))
+          last=""
+
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            # ParameterNotFound is expected on a first-ever deploy — treat as unset.
+            observed=$(aws ssm get-parameter --name "$RUNNING_PARAM" \
+              --query Parameter.Value --output text 2>/dev/null || echo "")
+
+            # Whole-value equality. NOT a regex match: `grep ":$TAG$"` treats the
+            # tag as a pattern, so semver dots match any character and an image
+            # tagged v1X2X3 would satisfy ":v1.2.3$".
+            if [ "$observed" = "$TAG" ]; then
+              elapsed=$(( SECONDS - start ))
+              {
+                echo "running_version=$observed"
+                echo "elapsed=$elapsed"
+              } >> "$GITHUB_OUTPUT"
+              echo "Converged in ${elapsed}s — instance reports it is running $TAG"
+              {
+                echo "### Deployed \`${TAG}\`"
+                echo ""
+                echo "- converged in **${elapsed}s**"
+                echo "- \`${RUNNING_PARAM}\` = \`${observed}\`"
+                echo ""
+                echo "_CI wrote desired state and observed convergence. It executed nothing on the instance._"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+
+            if [ "$observed" != "$last" ]; then
+              echo "  observed: ${observed:-<unset>} (want $TAG, ${SECONDS}s elapsed)"
+              last="$observed"
+            fi
+            sleep "$INTERVAL"
+          done
+
+          echo "::error::Instance did not converge on $TAG within ${TIMEOUT}s."
+          echo "::error::Last observed ${RUNNING_PARAM}=${last:-<unset>}"
+          echo "::error::The container is NOT confirmed running $TAG. Check, in order:"
+          echo "::error::  1. the poll timer on the instance — systemctl status <service>-watch.timer"
+          echo "::error::  2. the unit failed to start on the new image — journalctl -u <service>"
+          echo "::error::  3. image_tag does not match the tag actually pushed to ECR"
+          exit 1
