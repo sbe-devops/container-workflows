@@ -1,5 +1,28 @@
 name: Docker Deploy
 
+# Deploy a Docker-on-EC2 service: write the image tag to SSM, restart the
+# systemd unit, and VERIFY the container is actually running the tag that was
+# just deployed.
+#
+# ⚠️ WHY THE VERIFY STEPS EXIST — do not remove them to "simplify" this.
+# `aws ssm send-command` is FIRE-AND-FORGET. It returns success the moment the
+# command is *dispatched* and never reports what happened on the box. A deploy
+# step that only sends a command CANNOT FAIL, which means it cannot tell you
+# anything. Worse, a `systemctl restart` that relaunches the OLD image reports
+# success too — a green pipeline over an unchanged runtime, which is the
+# MTG v0.8.0 paper-tag failure one layer down.
+#
+# Three things turn a wish into a deploy, and all three are below:
+#   1. `aws ssm wait command-executed` — wait for the invocation
+#   2. assert `Status == Success`, printing stdout/stderr FIRST or you debug blind
+#   3. exact-match the running container's image tag against the tag you just
+#      released. NOT `grep ":<tag>$"` — that treats the tag as a regex, so the
+#      dots in a semver match any character. `awk -F: '$NF==t'` compares the
+#      tag field exactly.
+#
+# This workflow is the single implementation of that contract. A hand-rolled
+# deploy step in a service repo is drift — see standards/github-actions.md.
+
 on:
   workflow_call:
     inputs:
@@ -13,11 +36,15 @@ on:
         type: string
         default: us-east-1
       ssm_image_tag_param:
-        description: SSM Parameter Store path to write the image tag (e.g. /moby-trading/kraken/image-tag)
+        description: SSM Parameter Store path to write the image tag (e.g. /lorem/image-tag)
         required: true
         type: string
       image_tag:
-        description: Image tag to deploy (e.g. v0.3.1)
+        description: >-
+          Image tag to deploy, and the tag the running container is verified against.
+          Must be the tag ACTUALLY PUSHED — if the build used version_extract_command,
+          pass `needs.build.outputs.image_tag`, not the raw release tag, or verification
+          will correctly fail.
         required: true
         type: string
       ec2_instance_tag_key:
@@ -25,13 +52,36 @@ on:
         required: true
         type: string
       ec2_instance_tag_value:
-        description: EC2 tag value used to find the target instance (e.g. moby-trading)
+        description: >-
+          EC2 tag value used to find the target instance. MUST equal the module's
+          `project_name` — tf-aws-ec2-docker sets `Project` from it and overrides
+          anything passed in `tags`. A mismatch targets nothing, or the wrong instance.
         required: true
         type: string
       service_name:
         description: systemd service name to restart on the EC2 instance
         required: true
         type: string
+      container_name:
+        description: >-
+          Docker container name used to verify the running image. Defaults to
+          service_name, which is correct when the SBE naming rule is followed
+          (one word drives service, container, log group and SSM path).
+        required: false
+        type: string
+        default: ""
+      restart_wait_seconds:
+        description: Seconds to wait after restart before asserting the unit is active.
+        required: false
+        type: number
+        default: 15
+    outputs:
+      instance_id:
+        description: The EC2 instance the deploy targeted.
+        value: ${{ jobs.deploy.outputs.instance_id }}
+      image_ref:
+        description: The full image reference verified as running.
+        value: ${{ jobs.deploy.outputs.image_ref }}
 
 jobs:
   deploy:
@@ -43,37 +93,97 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    outputs:
+      instance_id: ${{ steps.target.outputs.instance_id }}
+      image_ref: ${{ steps.verify.outputs.image_ref }}
 
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ inputs.role_arn }}
           aws-region: ${{ inputs.aws_region }}
 
-      - name: Update image tag in SSM
+      # Resolved once into a step output rather than inline in the restart
+      # step — so every later step provably targets the same instance.
+      - name: Resolve target instance
+        id: target
+        env:
+          TAG_KEY: ${{ inputs.ec2_instance_tag_key }}
+          TAG_VALUE: ${{ inputs.ec2_instance_tag_value }}
         run: |
-          aws ssm put-parameter \
-            --name "${{ inputs.ssm_image_tag_param }}" \
-            --value "${{ inputs.image_tag }}" \
-            --type String \
-            --overwrite
-          echo "SSM ${{ inputs.ssm_image_tag_param }} → ${{ inputs.image_tag }}"
-
-      - name: Restart service on EC2
-        run: |
+          set -euo pipefail
           INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters \
-              "Name=tag:${{ inputs.ec2_instance_tag_key }},Values=${{ inputs.ec2_instance_tag_value }}" \
-              "Name=instance-state-name,Values=running" \
-            --query 'Reservations[0].Instances[0].InstanceId' \
-            --output text)
+            --filters "Name=tag:${TAG_KEY},Values=${TAG_VALUE}" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "No running instance found for tag ${{ inputs.ec2_instance_tag_key }}=${{ inputs.ec2_instance_tag_value }}"
+            echo "::error::No running instance tagged ${TAG_KEY}=${TAG_VALUE}."
+            echo "::error::If the instance exists, this is almost always a naming mismatch:"
+            echo "::error::tf-aws-ec2-docker sets Project from project_name and overrides var.tags."
             exit 1
           fi
-          aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters "commands=[\"systemctl restart ${{ inputs.service_name }}\"]"
-          echo "Deployed ${{ inputs.image_tag }} → $INSTANCE_ID (service: ${{ inputs.service_name }})"
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "Target: $INSTANCE_ID (${TAG_KEY}=${TAG_VALUE})"
+
+      - name: Update image tag in SSM
+        env:
+          PARAM: ${{ inputs.ssm_image_tag_param }}
+          TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          aws ssm put-parameter --name "$PARAM" --value "$TAG" --type String --overwrite
+          echo "SSM $PARAM → $TAG"
+
+
+      - name: Restart and verify
+        id: verify
+        env:
+          INSTANCE_ID: ${{ steps.target.outputs.instance_id }}
+          SERVICE: ${{ inputs.service_name }}
+          CONTAINER: ${{ inputs.container_name }}
+          TAG: ${{ inputs.image_tag }}
+          WAIT_SECONDS: ${{ inputs.restart_wait_seconds }}
+        run: |
+          set -euo pipefail
+          CONTAINER="${CONTAINER:-$SERVICE}"
+
+          # The verification lives in the REMOTE script on purpose: if the unit
+          # does not come up, or comes up on the wrong image, the SSM command
+          # itself fails and the Status assertion below catches it.
+          printf '%s\n' \
+            'set -eux' \
+            "systemctl restart ${SERVICE}" \
+            "sleep ${WAIT_SECONDS}" \
+            "systemctl is-active --quiet ${SERVICE}" \
+            "docker ps --filter name=${CONTAINER} --format '{{.Image}} {{.Status}}'" \
+            "RUNNING=\$(docker ps --filter name=${CONTAINER} --format '{{.Image}}')" \
+            "echo \"\$RUNNING\"" \
+            "echo \"\$RUNNING\" | awk -F: -v t='${TAG}' '\$NF==t{f=1} END{exit !f}'" \
+            > /tmp/restart.sh
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" --document-name "AWS-RunShellScript" \
+            --comment "deploy $TAG" \
+            --parameters "$(jq -Rs '{commands: [.]}' < /tmp/restart.sh)" \
+            --query 'Command.CommandId' --output text)
+
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" || true
+          INV=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID")
+          echo "--- stdout ---"; jq -r '.StandardOutputContent' <<<"$INV"
+          echo "--- stderr ---"; jq -r '.StandardErrorContent'  <<<"$INV"
+          [ "$(jq -r '.Status' <<<"$INV")" = "Success" ] || {
+            echo "::error::Deploy FAILED on $INSTANCE_ID — ${SERVICE} did not come up running ${TAG}."
+            echo "::error::A restart that relaunches the OLD image fails here by design."
+            exit 1; }
+
+          IMAGE_REF=$(jq -r '.StandardOutputContent' <<<"$INV" | grep -oE "[^ ]+:${TAG}" | head -1 || true)
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Deployed \`${TAG}\`"
+            echo ""
+            echo "- instance: \`${INSTANCE_ID}\`"
+            echo "- service: \`${SERVICE}\` · container: \`${CONTAINER}\`"
+            echo "- verified running: \`${IMAGE_REF:-${TAG}}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Verified: ${SERVICE} is running ${TAG} on ${INSTANCE_ID}"
