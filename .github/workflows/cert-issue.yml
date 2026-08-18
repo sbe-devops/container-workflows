@@ -1,0 +1,304 @@
+name: Issue TLS Certificate
+
+# Issue a Let's Encrypt certificate in CI, store it in S3, and PROVE the server
+# is actually serving it. Implements ADR-0038 §1/§2/§6/§6a.
+#
+# The host has no certbot, no scheduler, no Route53 permissions and no
+# /etc/letsencrypt. It fetches from S3 at unit start and nothing else. That is
+# the whole point of ADR-0038: there is no renewal state to persist, no cron to
+# install, and no certbot namespace to poison, because none of it is there.
+#
+# ⚠️ THIS WORKFLOW OBSERVES A RESTART, IT DOES NOT CAUSE ONE — deliberately.
+#    CD holds `s3:PutObject` and `ssm:GetParameter` and nothing else. It does not
+#    hold `ssm:SendCommand` and must not: a deploy role with SendCommand on
+#    AWS-RunShellScript holds arbitrary root on the instance, which inherits the
+#    instance profile. That is ADR-0037's decision and this workflow does not
+#    reopen it.
+#
+#    Something MODULE-SIDE must notice the new object and restart the unit —
+#    `ExecStartPre` then re-fetches. This workflow waits for the served
+#    fingerprint to change, so it is correct whichever trigger the module uses
+#    and needs no change when that lands.
+#
+# 🔗 REQUIRES tf-aws-ec2-docker publishing `tls_fingerprint` / `tls_not_after` in
+#    its observed-state parameter (ADR-0038 §6a), AND a module-side restart
+#    trigger on certificate change. **At the time of writing the second does not
+#    exist** — see the timeout diagnostic below, which says so at the point of
+#    failure rather than leaving a mystery timeout.
+
+on:
+  workflow_call:
+    inputs:
+      role_arn:
+        description: >-
+          IAM role to assume (OIDC). Needs Route53 for the DNS-01 challenge,
+          s3:PutObject on <s3_prefix>/* , and ssm:GetParameter on the observed-state
+          parameter. No SendCommand. No s3:GetObject — this role publishes, the
+          instance reads.
+        required: true
+        type: string
+      aws_region:
+        description: AWS region.
+        required: false
+        type: string
+        default: us-east-1
+      domains:
+        description: >-
+          Comma-separated SANs, e.g. "example.com,www.example.com,api.example.com".
+          ⚠️ Let's Encrypt's duplicate-certificate limit is 5 per week per EXACT
+          name set — changing this list starts a fresh budget, re-running with the
+          same list spends the existing one.
+        required: true
+        type: string
+      email:
+        description: Let's Encrypt account email for expiry notices.
+        required: true
+        type: string
+      s3_bucket:
+        description: Certificate bucket — one per engagement, `<engagement>-tls` (ADR-0038 §6).
+        required: true
+        type: string
+      s3_prefix:
+        description: >-
+          Object key prefix, the service name. Writes <prefix>/fullchain.pem and
+          <prefix>/privkey.pem — the exact keys the module's fetch script reads.
+        required: true
+        type: string
+      ssm_running_image_param:
+        description: >-
+          The instance's observed-state parameter. Read to prove the SERVED
+          certificate changed. Module output: `running_image_param`.
+        required: true
+        type: string
+      poll_timeout_seconds:
+        description: >-
+          How long to wait for the server to serve the new certificate. Must
+          exceed the module's converge_interval_seconds plus a container restart.
+        required: false
+        type: number
+        default: 600
+      poll_interval_seconds:
+        description: Seconds between reads of the observed-state parameter.
+        required: false
+        type: number
+        default: 15
+      staging:
+        description: >-
+          Use Let's Encrypt STAGING. Certificates are untrusted by browsers but do
+          not consume the production rate limit. Use for the first run against a
+          new engagement, and for any debugging.
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      fingerprint:
+        description: SHA-256 fingerprint of the issued certificate, as the module reports it.
+        value: ${{ jobs.issue.outputs.fingerprint }}
+      not_after:
+        description: Expiry of the issued certificate.
+        value: ${{ jobs.issue.outputs.not_after }}
+      served:
+        description: >-
+          "true" only when the SERVED fingerprint was observed to match. "false"
+          means the certificate is published but not yet in use.
+        value: ${{ jobs.issue.outputs.served }}
+
+jobs:
+  issue:
+    name: Issue, publish, and prove served
+    runs-on: ubuntu-24.04-arm
+    # Hang protection, not a budget. Must exceed poll_timeout_seconds so the
+    # poll's own diagnostic wins over an opaque job kill.
+    timeout-minutes: 25
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      fingerprint: ${{ steps.issue.outputs.fingerprint }}
+      not_after: ${{ steps.issue.outputs.not_after }}
+      served: ${{ steps.serve.outputs.served }}
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      # Captured BEFORE publishing. Convergence later requires the served
+      # fingerprint to have CHANGED from this, not merely to equal the new one —
+      # otherwise re-running with an unchanged certificate would pass instantly
+      # having proven nothing, which is the same false-green `docker-deploy.yml`
+      # avoids with observed_at.
+      - name: Capture the currently served certificate
+        id: prior
+        env:
+          PARAM: ${{ inputs.ssm_running_image_param }}
+        run: |
+          set -euo pipefail
+          raw=$(aws ssm get-parameter --name "$PARAM" \
+            --query Parameter.Value --output text 2>/dev/null || echo "")
+          fp=$(jq -r '.tls_fingerprint // ""' <<<"${raw:-{\}}" 2>/dev/null || echo "")
+          na=$(jq -r '.tls_not_after // ""'   <<<"${raw:-{\}}" 2>/dev/null || echo "")
+          echo "prior_fp=$fp" >> "$GITHUB_OUTPUT"
+          echo "Currently served: ${fp:-<none>}  (expires ${na:-<unknown>})"
+
+      - name: Install certbot with the Route53 DNS plugin
+        run: |
+          set -euo pipefail
+          # pip, not a curl of a binary: versioned, checksummed by the index, and
+          # removable. standards/github-actions.md forbids the inline-curl shape.
+          python3 -m pip install --quiet --disable-pip-version-check \
+            certbot certbot-dns-route53
+          certbot --version
+
+      # DNS-01 rather than HTTP-01: no inbound port 80, and it is the only
+      # challenge that works for a host that is not publicly reachable.
+      - name: Issue the certificate
+        id: issue
+        env:
+          DOMAINS: ${{ inputs.domains }}
+          EMAIL: ${{ inputs.email }}
+          STAGING: ${{ inputs.staging }}
+        run: |
+          set -euo pipefail
+          args=()
+          IFS=',' read -ra names <<<"$DOMAINS"
+          for n in "${names[@]}"; do
+            n="$(echo "$n" | tr -d '[:space:]')"
+            [ -n "$n" ] && args+=(-d "$n")
+          done
+          [ ${#args[@]} -gt 0 ] || { echo "::error::no domains parsed from '$DOMAINS'"; exit 1; }
+
+          extra=()
+          if [ "$STAGING" = "true" ]; then
+            extra+=(--staging)
+            echo "::warning::STAGING certificate — untrusted by browsers. Does not spend the production rate limit."
+          fi
+
+          certbot certonly \
+            --dns-route53 \
+            --non-interactive --agree-tos \
+            --email "$EMAIL" \
+            --cert-name sbe \
+            --key-type ecdsa \
+            "${args[@]}" "${extra[@]+"${extra[@]}"}"
+
+          live=/etc/letsencrypt/live/sbe
+          sudo cp "$live/fullchain.pem" "$live/privkey.pem" .
+          sudo chown "$(id -u):$(id -g)" fullchain.pem privkey.pem
+          chmod 600 privkey.pem
+
+          # EXACTLY the command tf-aws-ec2-docker's converge script uses to
+          # populate tls_fingerprint. If these two ever diverge the comparison
+          # below silently never matches, and the deploy reads as a broken
+          # workflow rather than a broken contract.
+          fp=$(openssl x509 -in fullchain.pem -noout -fingerprint -sha256 | cut -d= -f2)
+          na=$(openssl x509 -in fullchain.pem -noout -enddate | cut -d= -f2)
+          echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"
+          echo "not_after=$na"   >> "$GITHUB_OUTPUT"
+          echo "Issued $fp (expires $na)"
+
+      # ADR-0038 §6b is a READER obligation, but publishing a mismatched pair in
+      # the first place is a writer defect. Cheap to check here, and it means a
+      # broken pair never reaches the bucket at all.
+      - name: Verify the pair before publishing
+        run: |
+          set -euo pipefail
+          cert_spki=$(openssl x509 -in fullchain.pem -noout -pubkey | openssl sha256)
+          key_spki=$(openssl pkey -in privkey.pem -pubout | openssl sha256)
+          if [ "$cert_spki" != "$key_spki" ]; then
+            echo "::error::certificate and private key do not match — refusing to publish."
+            echo "::error::Publishing this pair would leave nginx unable to start."
+            exit 1
+          fi
+          openssl x509 -in fullchain.pem -noout -checkend 0 >/dev/null
+          echo "✓ pair matches and the certificate is currently valid"
+
+      # Key first, then certificate. The two objects are written separately, so a
+      # reader can observe a half-published set; the module validates the pair and
+      # falls back to its cache, so either order is safe. Key-first means the
+      # window shows new-key + old-cert, which fails the module's check for the
+      # same reason as the reverse — stated so the order is not "re-tidied" later
+      # on the assumption that it is arbitrary.
+      - name: Publish to S3
+        env:
+          BUCKET: ${{ inputs.s3_bucket }}
+          PREFIX: ${{ inputs.s3_prefix }}
+          REGION: ${{ inputs.aws_region }}
+        run: |
+          set -euo pipefail
+          aws s3 cp privkey.pem    "s3://$BUCKET/$PREFIX/privkey.pem"    --region "$REGION" --only-show-errors
+          aws s3 cp fullchain.pem  "s3://$BUCKET/$PREFIX/fullchain.pem"  --region "$REGION" --only-show-errors
+          echo "Published to s3://$BUCKET/$PREFIX/"
+          rm -f privkey.pem fullchain.pem
+
+      # §6a. The assertion that makes §3a's cache fallback visible instead of
+      # silent: a container that started from cache CAME UP, so liveness proves
+      # nothing. Only the served fingerprint does.
+      - name: Wait until the server is serving it
+        id: serve
+        env:
+          PARAM: ${{ inputs.ssm_running_image_param }}
+          WANT: ${{ steps.issue.outputs.fingerprint }}
+          PRIOR: ${{ steps.prior.outputs.prior_fp }}
+          TIMEOUT: ${{ inputs.poll_timeout_seconds }}
+          INTERVAL: ${{ inputs.poll_interval_seconds }}
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          deadline=$(( start + TIMEOUT ))
+          last=""
+          state="{}"
+
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            raw=$(aws ssm get-parameter --name "$PARAM" \
+              --query Parameter.Value --output text 2>/dev/null || echo "")
+            if [ -n "$raw" ] && jq -e . >/dev/null 2>&1 <<<"$raw"; then
+              state="$raw"
+              fp=$(jq -r '.tls_fingerprint // ""' <<<"$raw")
+              healthy=$(jq -r '.healthy // false' <<<"$raw")
+              if [ "$fp" = "$WANT" ] && [ "$healthy" = "true" ]; then
+                elapsed=$(( SECONDS - start ))
+                echo "served=true" >> "$GITHUB_OUTPUT"
+                echo "Serving the new certificate after ${elapsed}s"
+                {
+                  echo "### TLS certificate live"
+                  echo ""
+                  echo "| | |"
+                  echo "|---|---|"
+                  echo "| fingerprint | \`${WANT}\` |"
+                  echo "| expires | ${{ steps.issue.outputs.not_after }} |"
+                  echo "| observed serving after | **${elapsed}s** |"
+                  echo ""
+                  echo "_Verified against the certificate the server is actually serving, not against liveness._"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              summary="served=${fp:-<none>} healthy=$healthy"
+            else
+              summary="no observed state published yet"
+            fi
+            [ "$summary" != "$last" ] && { echo "  ${SECONDS}s: $summary"; last="$summary"; }
+            sleep "$INTERVAL"
+          done
+
+          served_fp=$(jq -r '.tls_fingerprint // ""' <<<"$state")
+          echo "served=false" >> "$GITHUB_OUTPUT"
+          echo "::error::The certificate was published to S3 but the server is not serving it."
+          echo "::error::Issued:  ${WANT}"
+          echo "::error::Serving: ${served_fp:-<none>}"
+          echo "::error::"
+          if [ -n "$served_fp" ] && [ "$served_fp" = "$PRIOR" ]; then
+            echo "::error::The served fingerprint has not moved at all. The most likely cause is that"
+            echo "::error::NOTHING RESTARTED THE UNIT. The certificate only reaches nginx via"
+            echo "::error::ExecStartPre, which re-runs on restart — and the converge timer restarts"
+            echo "::error::only when the DESIRED IMAGE TAG changes. A certificate refresh changes no"
+            echo "::error::tag, so a module without a certificate-change trigger will never pick this"
+            echo "::error::up. Check the module version carries one."
+            echo "::error::"
+          fi
+          echo "::error::⚠️ DO NOT simply re-run. The certificate is already published and re-issuing"
+          echo "::error::spends the Let's Encrypt duplicate limit (5/week per exact name set). Fix the"
+          echo "::error::restart path; the object in S3 is already correct."
+          exit 1
