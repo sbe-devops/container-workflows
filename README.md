@@ -53,13 +53,39 @@ After validating a release (structure tests passed, smoke-tested in a lower envi
 
 ---
 
-### `docker-deploy.yml` — Deploy image tag to EC2 via SSM
+### `docker-deploy.yml` — Deploy an image tag to EC2, and prove it converged
 
-Writes the image tag to an SSM Parameter Store path and restarts the systemd service on the target EC2 instance via SSM Send-Command. Finds the instance by EC2 tag key/value.
+Writes the **desired** image tag to an SSM parameter and waits for the instance to publish **observed** state matching it. CI executes nothing on the box.
 
 **When to use:**
 
-Use for EC2-hosted services that use the `tf-aws-ec2-docker` deployment pattern. The instance must have SSM Agent running and the IAM role must allow `ssm:SendCommand`. After the command is sent the workflow does not wait for completion — verify service health via CloudWatch Logs or instance health checks.
+EC2-hosted services on the `tf-aws-ec2-docker` pattern. Requires the module at **`>= v0.4.0`** with `ssm_running_image_param` set and `converge_interval_seconds > 0` — without the timer nothing publishes observed state and every deploy times out, correctly, because nothing has been proven.
+
+> ### ⚠️ This workflow does NOT hold `ssm:SendCommand`, and must not
+> The deploy role needs exactly two actions: `ssm:PutParameter` on the desired-tag parameter and `ssm:GetParameter` on the observed-state parameter.
+>
+> A deploy role holding `SendCommand` on `AWS-RunShellScript` holds **arbitrary root** on the instance, which inherits the instance profile and can read the whole `/<service>/*` parameter tree — including parameters the deploy role itself cannot read. That is a four-step escalation whose last three steps are automatic, reachable by anything able to trigger this workflow. See ADR-0037.
+>
+> **This section previously documented the opposite** — Send-Command, instance lookup by EC2 tag, and fire-and-forget with *"the workflow does not wait for completion."* All three were removed in **v0.11.0** and the description was not updated with them. If you built a caller from that text, your IAM is wider than it needs to be and your inputs no longer exist.
+
+---
+
+### `cert-issue.yml` — Issue a TLS certificate in CI, store it in S3, prove it is served
+
+Runs certbot with **DNS-01 via Route53**, publishes `fullchain.pem` and `privkey.pem` to an engagement's certificate bucket, then waits until the instance reports it is **serving that exact certificate**.
+
+**When to use:**
+
+Any `tf-aws-ec2-docker` service that terminates TLS. Implements ADR-0038: the host gets no certbot, no scheduler, no Route53 permissions and no `/etc/letsencrypt` — it fetches from S3 at unit start and nothing else. Call it **monthly** against a 90-day certificate, so a missed month leaves 60 days of headroom and it degrades gradually rather than cliff-edging.
+
+> ### It observes a restart; it does not cause one
+> CD holds `s3:PutObject` and `ssm:GetParameter` and nothing else — **no `SendCommand`**, for the reason in `docker-deploy.yml` above.
+>
+> Something **module-side** must notice the new object and restart the unit; `ExecStartPre` then re-fetches. This workflow waits for the **served fingerprint** to change, so it is correct whichever trigger the module uses.
+>
+> **Liveness is not proof.** A container that fell back to the §3a cached certificate *came up* — so asserting "the unit started" would pass while the server serves a stale certificate. Only the served fingerprint distinguishes them, which is why this workflow reads `tls_fingerprint` from observed state rather than checking health.
+
+**Rate limits matter here.** Let's Encrypt allows 5 duplicate certificates per week per exact name set. Use `staging: true` for first runs and debugging, and **do not re-run on a timeout** — the certificate is already published; the failure is in the restart path.
 
 ---
 
@@ -303,11 +329,13 @@ jobs:
 |---|---|:---:|---|---|
 | `role_arn` | string | yes | — | IAM role ARN to assume for deployment (OIDC) |
 | `aws_region` | string | no | `us-east-1` | AWS region |
-| `ssm_image_tag_param` | string | yes | — | SSM Parameter Store path to write the image tag (e.g. `/my-project/my-service/image-tag`) |
-| `image_tag` | string | yes | — | Image tag to deploy (e.g. `v0.3.1`) |
-| `ec2_instance_tag_key` | string | yes | — | EC2 tag key used to find the target instance (e.g. `Project`) |
-| `ec2_instance_tag_value` | string | yes | — | EC2 tag value used to find the target instance (e.g. `my-project`) |
-| `service_name` | string | yes | — | systemd service name to restart on the EC2 instance |
+| `ssm_image_tag_param` | string | yes | — | SSM parameter holding the **desired** image tag |
+| `ssm_running_image_param` | string | yes | — | Parameter the instance publishes **observed** state to. Module output: `running_image_param` |
+| `image_tag` | string | yes | — | Tag to deploy. Must be the tag **actually pushed** — pass `needs.build.outputs.image_tag`, not the raw release tag |
+| `poll_timeout_seconds` | number | no | `300` | Must exceed `converge_interval_seconds` + image pull + container start |
+| `poll_interval_seconds` | number | no | `10` | Seconds between reads of the observed-state parameter |
+
+`ec2_instance_tag_key`, `ec2_instance_tag_value` and `service_name` were **removed in v0.11.0** — there is no instance lookup any more, which also removes the whole class of "the deploy targeted the wrong box, or nothing" tag-filter bugs.
 
 ---
 
