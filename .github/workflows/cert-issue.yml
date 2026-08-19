@@ -106,6 +106,32 @@ on:
 jobs:
   issue:
     name: Issue, publish, and prove served
+    # Serialize per SERVICE, and never cancel.
+    #
+    # Two concurrent runs for the same service is not a theoretical race — a
+    # monthly `schedule` firing while someone dispatches manually is the ordinary
+    # way to get one, and it is exactly when someone is dispatching.
+    #
+    # What happens without this: both runs issue a certificate (spending TWO of
+    # Let's Encrypt's 5-per-week duplicate budget), both publish, and the loser's
+    # `Wait until the server is serving it` never sees ITS fingerprint — so it
+    # times out and reports a restart-path failure while the system is healthy and
+    # serving the other certificate. A false failure with a misleading diagnostic.
+    #
+    # Worse if the two uploads interleave: `privkey.pem` from one run and
+    # `fullchain.pem` from the other. §6b's reader validation catches the mismatch
+    # and falls back to the cache, so it is not an outage — but the certificate
+    # silently never updates and both runs fail confusingly.
+    #
+    # Keyed on bucket+prefix rather than the workflow, so two different services
+    # do not block each other; two runs for the SAME service must.
+    #
+    # cancel-in-progress: false — cancelling mid-issue burns a rate-limit unit for
+    # a certificate nobody receives, and can leave exactly the half-published pair
+    # described above. Same reasoning as sync-peers.yml.
+    concurrency:
+      group: cert-issue-${{ inputs.s3_bucket }}-${{ inputs.s3_prefix }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04-arm
     # Hang protection, not a budget. Must exceed poll_timeout_seconds so the
     # poll's own diagnostic wins over an opaque job kill.
