@@ -236,7 +236,12 @@ jobs:
             echo "::error::Publishing this pair would leave nginx unable to start."
             exit 1
           fi
-          openssl x509 -in fullchain.pem -noout -checkend 0 >/dev/null
+          if ! openssl x509 -in fullchain.pem -noout -checkend 0 >/dev/null; then
+            echo "::error::the certificate certbot just issued is already expired or invalid."
+            echo "::error::  notAfter: $(openssl x509 -in fullchain.pem -noout -enddate 2>&1)"
+            echo "::error::Check the runner clock before suspecting Let's Encrypt."
+            exit 1
+          fi
           echo "✓ pair matches and the certificate is currently valid"
 
       # Key first, then certificate. The two objects are written separately, so a
@@ -270,6 +275,14 @@ jobs:
           INTERVAL: ${{ inputs.poll_interval_seconds }}
         run: |
           set -euo pipefail
+
+          # An empty WANT would match an instance that has NO certificate
+          # installed -- tls_fingerprint is "" there too -- and pass having proven
+          # the opposite of what it claims. `set -euo pipefail` on the issue step
+          # should make this impossible; this is the assertion that says so rather
+          # than assuming it.
+          [ -n "$WANT" ] || { echo "::error::issued fingerprint is empty — refusing to assert against it"; exit 1; }
+
           start=$SECONDS
           deadline=$(( start + TIMEOUT ))
           last=""
@@ -282,7 +295,15 @@ jobs:
               state="$raw"
               fp=$(jq -r '.tls_fingerprint // ""' <<<"$raw")
               healthy=$(jq -r '.healthy // false' <<<"$raw")
-              if [ "$fp" = "$WANT" ] && [ "$healthy" = "true" ]; then
+              # All three. `fp = WANT` alone is not proof: if a future change ever
+              # reuses a certificate across runs -- caching certbot's config dir to
+              # save Let's Encrypt budget is the obvious one, and the rate limit
+              # makes it likely -- then WANT could equal what was ALREADY being
+              # served, and this would pass instantly having observed nothing.
+              # Requiring it to differ from PRIOR is what makes that impossible
+              # rather than merely unlikely. The comment on the `prior` step has
+              # claimed this property since v0.12.0; the code did not implement it.
+              if [ "$fp" = "$WANT" ] && [ "$fp" != "$PRIOR" ] && [ "$healthy" = "true" ]; then
                 elapsed=$(( SECONDS - start ))
                 echo "served=true" >> "$GITHUB_OUTPUT"
                 echo "Serving the new certificate after ${elapsed}s"
