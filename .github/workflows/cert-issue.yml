@@ -176,17 +176,29 @@ jobs:
             echo "::warning::STAGING certificate — untrusted by browsers. Does not spend the production rate limit."
           fi
 
+          # --config-dir/--work-dir/--logs-dir, not sudo. certbot's own
+          # defaults (/etc/letsencrypt, /var/lib/letsencrypt,
+          # /var/log/letsencrypt) require root; the runner user has none.
+          # certbot's own error message names both fixes -- this one avoids
+          # a second problem sudo would introduce: AWS_* creds (this step's
+          # whole DNS-01 auth) live in the calling user's environment, and a
+          # bare `sudo` resets that environment by default. `sudo -E` would
+          # work too, IF the runner's sudoers preserves it -- writable dirs
+          # sidestep needing to know either way.
+          certbot_home="$(mktemp -d)"
           certbot certonly \
             --dns-route53 \
             --non-interactive --agree-tos \
             --email "$EMAIL" \
             --cert-name sbe \
             --key-type ecdsa \
+            --config-dir "$certbot_home/config" \
+            --work-dir "$certbot_home/work" \
+            --logs-dir "$certbot_home/logs" \
             "${args[@]}" "${extra[@]+"${extra[@]}"}"
 
-          live=/etc/letsencrypt/live/sbe
-          sudo cp "$live/fullchain.pem" "$live/privkey.pem" .
-          sudo chown "$(id -u):$(id -g)" fullchain.pem privkey.pem
+          live="$certbot_home/config/live/sbe"
+          cp "$live/fullchain.pem" "$live/privkey.pem" .
           chmod 600 privkey.pem
 
           # EXACTLY the command tf-aws-ec2-docker's converge script uses to

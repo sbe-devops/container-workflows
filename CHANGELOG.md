@@ -8,6 +8,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [s
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cert-issue.yml`: certbot couldn't write its default paths on a GitHub-hosted runner.**
+  `certbot certonly` defaults to `/etc/letsencrypt`, `/var/lib/letsencrypt`,
+  `/var/log/letsencrypt` — all root-owned, and the runner user isn't root. First real dispatch of
+  this workflow failed immediately: `[Errno 13] Permission denied: '/var/log/letsencrypt'`. Fixed
+  with `--config-dir`/`--work-dir`/`--logs-dir` pointed at a `mktemp -d` instead of `sudo` — the
+  DNS-01 challenge's AWS credentials live in this step's environment, and a bare `sudo` resets
+  that environment by default, which would have traded one failure for a harder-to-diagnose one.
+  *(Found by SBE INFRA on fitbooks-io's first real dispatch, staging.)*
+
 ### Changed
 
 - Pin all four `security-actions` composite actions to **`@v0.4.0`**. They live in a single
