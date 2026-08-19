@@ -20,11 +20,12 @@ name: Issue TLS Certificate
 #    fingerprint to change, so it is correct whichever trigger the module uses
 #    and needs no change when that lands.
 #
-# 🔗 REQUIRES tf-aws-ec2-docker publishing `tls_fingerprint` / `tls_not_after` in
-#    its observed-state parameter (ADR-0038 §6a), AND a module-side restart
-#    trigger on certificate change. **At the time of writing the second does not
-#    exist** — see the timeout diagnostic below, which says so at the point of
-#    failure rather than leaving a mystery timeout.
+# 🔗 REQUIRES tf-aws-ec2-docker >= v0.5.0. Two things, both shipped there:
+#    `tls_fingerprint` / `tls_not_after` in the observed-state parameter
+#    (ADR-0038 §6a), and the converge timer comparing the S3 object's ETag so a
+#    certificate change restarts the unit at all. Against an earlier module this
+#    publishes correctly and then times out — nothing restarts, so ExecStartPre
+#    never re-fetches. The timeout diagnostic says exactly that.
 
 on:
   workflow_call:
@@ -35,6 +36,10 @@ on:
           s3:PutObject on <s3_prefix>/* , and ssm:GetParameter on the observed-state
           parameter. No SendCommand. No s3:GetObject — this role publishes, the
           instance reads.
+          ⚠️ If the bucket uses a customer-managed KMS key (`tf-aws-s3`'s opt-in
+          `kms_key_arn`, ADR-0038 §6), this role ALSO needs `kms:GenerateDataKey*`
+          on that key — PutObject into an SSE-KMS bucket fails with AccessDenied
+          without it, and the message names the S3 action rather than the key.
         required: true
         type: string
       aws_region:
@@ -55,7 +60,14 @@ on:
         required: true
         type: string
       s3_bucket:
-        description: Certificate bucket — one per engagement, `<engagement>-tls` (ADR-0038 §6).
+        description: >-
+          Certificate bucket. ⚠️ ONE PER ACCOUNT, not per engagement — `tst` and `prd`
+          are separate accounts, so each has its own and neither reaches across the
+          boundary (ADR-0038 §6c, corrected 2026-08-18). Named
+          `<first-class-domain, dots→hyphens>-<environment>-tls`, e.g.
+          `fitbks-io-tst-tls`; derived by `tf-aws-s3` >= v0.2.0 from
+          domain/environment/purpose rather than passed as a string. Key prefixes
+          separate SERVICES; they do not separate environments.
         required: true
         type: string
       s3_prefix:
@@ -72,8 +84,12 @@ on:
         type: string
       poll_timeout_seconds:
         description: >-
-          How long to wait for the server to serve the new certificate. Must
-          exceed the module's converge_interval_seconds plus a container restart.
+          How long to wait for the server to serve the new certificate. Budget for
+          TWO converge ticks, not one: the timer must first notice the changed S3
+          ETag and restart the unit, and the NEW fingerprint is only published on
+          the tick after that. So `2 x converge_interval_seconds` + image pull +
+          container start, with headroom. The 600s default is comfortable at the
+          module's default 30s interval.
         required: false
         type: number
         default: 600
@@ -99,8 +115,13 @@ on:
         value: ${{ jobs.issue.outputs.not_after }}
       served:
         description: >-
-          "true" only when the SERVED fingerprint was observed to match. "false"
-          means the certificate is published but not yet in use.
+          "true" only when the SERVED fingerprint was observed to match.
+          ⚠️ In practice a caller only ever sees "true": the wait step exits 1 when
+          it does not converge, so the job fails and downstream `needs` do not run.
+          The "false" path exists so the value is never a lie, not as something to
+          branch on — if you want to tolerate a non-converged publish, you need
+          `continue-on-error` on the calling job, and you should think hard about
+          why.
         value: ${{ jobs.issue.outputs.served }}
 
 jobs:
@@ -337,10 +358,13 @@ jobs:
           if [ -n "$served_fp" ] && [ "$served_fp" = "$PRIOR" ]; then
             echo "::error::The served fingerprint has not moved at all. The most likely cause is that"
             echo "::error::NOTHING RESTARTED THE UNIT. The certificate only reaches nginx via"
-            echo "::error::ExecStartPre, which re-runs on restart — and the converge timer restarts"
-            echo "::error::only when the DESIRED IMAGE TAG changes. A certificate refresh changes no"
-            echo "::error::tag, so a module without a certificate-change trigger will never pick this"
-            echo "::error::up. Check the module version carries one."
+            echo "::error::ExecStartPre, which re-runs on restart. From tf-aws-ec2-docker v0.5.0 the"
+            echo "::error::converge timer restarts on a changed S3 ETag — BELOW v0.5.0 it restarts only"
+            echo "::error::on a changed image tag, and a certificate refresh changes no tag, so it will"
+            echo "::error::never pick this up. Check the module version FIRST."
+            echo "::error::On v0.5.0+, suspect instead: the converge timer not running"
+            echo "::error::(systemctl status <container>-converge.timer), or the instance role missing"
+            echo "::error::s3:GetObject on the bucket, which fails the fetch silently into the cache."
             echo "::error::"
           fi
           echo "::error::⚠️ DO NOT simply re-run. The certificate is already published and re-issuing"
