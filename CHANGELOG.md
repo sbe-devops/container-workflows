@@ -18,6 +18,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [s
   DNS-01 challenge's AWS credentials live in this step's environment, and a bare `sudo` resets
   that environment by default, which would have traded one failure for a harder-to-diagnose one.
   *(Found by SBE INFRA on fitbooks-io's first real dispatch, staging.)*
+- **`cert-issue.yml`: scratch space moved from `mktemp -d` to `$RUNNER_TEMP`.** Both are writable;
+  they are not the same guarantee. `RUNNER_TEMP` is the platform's per-job scratch and is cleaned
+  between jobs, while `/tmp` is writable by accident of the host and — on a self-hosted runner —
+  persists across jobs and is shared. This step writes a TLS private key. It is also the convention
+  every other SBE workflow already used, so this was the only file deviating from it.
 
 ### Changed
 

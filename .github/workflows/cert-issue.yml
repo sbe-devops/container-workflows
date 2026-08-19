@@ -185,7 +185,19 @@ jobs:
           # bare `sudo` resets that environment by default. `sudo -E` would
           # work too, IF the runner's sudoers preserves it -- writable dirs
           # sidestep needing to know either way.
-          certbot_home="$(mktemp -d)"
+          # RUNNER_TEMP, not mktemp -d. Both are writable, but they are not the
+          # same guarantee: RUNNER_TEMP is the platform's designated per-job
+          # scratch and the runner cleans it between jobs, whereas /tmp is
+          # writable by accident of the host and — on a SELF-HOSTED runner —
+          # persists across jobs and is shared with everything else on the box.
+          # This step writes a TLS PRIVATE KEY, so "works because the runner
+          # happens to be ephemeral" is not a property to depend on.
+          #
+          # It is also the convention every other SBE workflow already uses
+          # (sync-peers.yml, validate-pr.yml). See standards/github-actions.md,
+          # "Scratch space".
+          certbot_home="${RUNNER_TEMP}/certbot"
+          mkdir -p "$certbot_home"
           certbot certonly \
             --dns-route53 \
             --non-interactive --agree-tos \
