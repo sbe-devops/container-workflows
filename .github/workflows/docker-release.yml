@@ -75,6 +75,14 @@ on:
         required: false
         type: string
         default: ""
+      pull:
+        description: >
+          Re-resolve every FROM ref against the registry instead of trusting a locally cached
+          base. DEFAULTS TO TRUE, and should stay true for anything building on a moving tag
+          (:latest, :2023). Set false only for a deliberately frozen, bit-reproducible build.
+        required: false
+        type: boolean
+        default: true
       base_image_role_arn:
         description: Optional IAM role ARN in a second account to assume before build so Docker can pull cross-account base images. When set, a second configure-aws-credentials + ecr-login step runs before the build, then primary credentials are restored.
         required: false
@@ -178,6 +186,21 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # 🔴 `pull` MUST BE SET ON BOTH BUILD STEPS. Without it a build trusts whatever base
+      # image the runner already has, so rolling a CSI gold image does NOT reach consumers —
+      # they keep rebuilding on the stale base and the run goes green.
+      #
+      # OBSERVED, not theoretical (MTG BOT, 2026-09-02): a failed job was re-run and produced
+      # an IDENTICAL failure, reading as "the base has not rolled." `gh cache list` showed the
+      # buildkit blob from the ORIGINAL run (sha256:bbef9fc5, 50.97 MiB, created 18:07:20) with
+      # a last-access time of 18:13:25 — the RE-RUN's own timestamp. The re-run ate the cache.
+      # ⇒ A RE-RUN CANNOT DISTINGUISH "latest has not moved" FROM "latest moved and the cache
+      #   served the old base." That is the diagnostic this defect destroys.
+      #
+      # ⚠️ IT DOES NOT DISABLE THE LAYER CACHE, and the cost is not what it looks like.
+      #   `pull` re-resolves FROM refs only. Base digest unchanged ⇒ the cached layers still
+      #   hit. Base digest changed ⇒ downstream cache keys change and it rebuilds, which is
+      #   the entire point. The bill is one manifest check per build.
       - name: Build (load for testing)
         uses: docker/build-push-action@v7
         with:
@@ -185,6 +208,7 @@ jobs:
           file: ${{ inputs.dockerfile }}
           load: true
           push: false
+          pull: ${{ inputs.pull }}
           tags: ${{ env.TEST_IMAGE }}
           build-args: ${{ inputs.build_args }}
           platforms: linux/arm64
@@ -255,6 +279,10 @@ jobs:
           context: ${{ inputs.build_context }}
           file: ${{ inputs.dockerfile }}
           push: true
+          # Both steps, not just the tested one. This is the build whose output ships;
+          # if only the test build re-resolved, the PUSHED image could still carry a
+          # stale base — the worse half of the same defect.
+          pull: ${{ inputs.pull }}
           tags: ${{ inputs.ecr_repository_url }}:${{ steps.final_tag.outputs.image_tag }}
           build-args: ${{ inputs.build_args }}
           platforms: linux/arm64
