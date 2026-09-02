@@ -186,21 +186,31 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # 🔴 `pull` MUST BE SET ON BOTH BUILD STEPS. Without it a build trusts whatever base
-      # image the runner already has, so rolling a CSI gold image does NOT reach consumers —
-      # they keep rebuilding on the stale base and the run goes green.
+      # ── `pull` IS BELT-AND-BRACES HERE. IT IS NOT FIXING A DEFECT. ────────────────
       #
-      # OBSERVED, not theoretical (MTG BOT, 2026-09-02): a failed job was re-run and produced
-      # an IDENTICAL failure, reading as "the base has not rolled." `gh cache list` showed the
-      # buildkit blob from the ORIGINAL run (sha256:bbef9fc5, 50.97 MiB, created 18:07:20) with
-      # a last-access time of 18:13:25 — the RE-RUN's own timestamp. The re-run ate the cache.
-      # ⇒ A RE-RUN CANNOT DISTINGUISH "latest has not moved" FROM "latest moved and the cache
-      #   served the old base." That is the diagnostic this defect destroys.
+      # 🔴 IF YOU ARE HERE BECAUSE SOMEONE REPORTED "consumers rebuild on a stale base
+      #    because pull: is missing" — THAT WAS INVESTIGATED ON 2026-09-02 AND IT IS NOT
+      #    HAPPENING. Do not re-litigate it. The measurement:
       #
-      # ⚠️ IT DOES NOT DISABLE THE LAYER CACHE, and the cost is not what it looks like.
-      #   `pull` re-resolves FROM refs only. Base digest unchanged ⇒ the cached layers still
-      #   hit. Base digest changed ⇒ downstream cache keys change and it rebuilds, which is
-      #   the entire point. The bill is one manifest check per build.
+      #      csi-python v26.8.0  #6 resolve …/csi-amazonlinux/amazonlinux:latest@sha256:8c2fb90e… done
+      #      csi-python v26.9.0  #6 resolve …/csi-amazonlinux/amazonlinux:latest@sha256:ae4f67a6… done
+      #
+      #    DIFFERENT DIGESTS, AND `pull:` WAS NOT SET FOR EITHER. Every build emits
+      #    `[internal] load metadata for …:latest` first — BuildKit re-resolves the tag
+      #    against the registry every run. `setup-buildx-action` uses the docker-container
+      #    driver, which has NO local image store to serve a stale base from, on a runner
+      #    that is fresh anyway.
+      #
+      # ⚠️ THE REPORT'S EVIDENCE DID NOT SUPPORT IT. A re-run touching a `type=gha` cache
+      #    blob is `cache-from` working as designed — equally consistent with "base
+      #    re-resolved, unchanged, layers legitimately hit." The re-run that prompted it
+      #    failed identically because csi-python/python3-14:latest HAD NOT BEEN PROMOTED.
+      #    The observation was right; the cause was invented.
+      #
+      # So why keep it: it is one word, it costs a manifest check already being made, and it
+      # WOULD matter on the `docker` driver with a warm daemon (a self-hosted runner). The
+      # input exists so a caller wanting a frozen, bit-reproducible base can turn it off.
+      # It does NOT disable the layer cache — it re-resolves FROM refs only.
       - name: Build (load for testing)
         uses: docker/build-push-action@v7
         with:
