@@ -298,6 +298,8 @@ jobs:
 | `extra_repo_path` | string | no | `"extra-repo"` | Path within the workspace to check out `extra_repo` into. Defaults to `extra-repo`. This directory is included in the Docker build context, so `COPY extra_repo_path /dest` works in the Dockerfile. |
 | `extra_repo_app_client_id` | string | no | `""` | GitHub App client ID used to mint a short-lived installation token for the `extra_repo` checkout. Pass the public client ID via a repo/org variable (e.g. `vars.MY_APP_CLIENT_ID`). Pair with `extra_repo_app_private_key` in the `secrets:` block. Omit for public `extra_repo`s — checkout falls back to the workflow's `GITHUB_TOKEN`. |
 | `extra_repo_app_private_key` | secret | no | — | GitHub App private key for the App identified by `extra_repo_app_client_id`. Must be passed via the `secrets:` block. The token is minted inside the build job (same job that uses it) — this avoids the `Skip output 'X' since it may contain secret` masking strip that breaks cross-job token passing. |
+| `verify_command` | string | no | `""` | Shell command run in the caller's workspace after the image is built, loaded and structure-tested, and **before** the scan and any push. `IMAGE` holds the loaded image's local ref. Non-zero fails the job, so nothing is pushed. Runs on PR builds too. For checks that must run the image and that a structure test can't express (e.g. an MCP engine's `tools/list`). |
+| `verify_artifact` | string | no | `""` | A file `verify_command` writes, uploaded as artifact `verify-<image_tag>` (30 days). Missing or empty after a successful `verify_command` fails the job. |
 
 ### `image-mirror.yml`
 
@@ -353,6 +355,7 @@ jobs:
 | Output | Description |
 |---|---|
 | `image_tag` | The final image tag pushed to ECR. If `version_extract_command` was set, this is `<runtime_version>-<image_tag>` (e.g. `3.11.15-v26.5.0`). Otherwise it is the raw `image_tag` input. |
+| `image_digest` | The pushed image's digest (`sha256:…`), the one that was signed and attested. Empty when `push: false`. Also written to the job summary as `<repo>@<digest>`. Read it here to run or pin the image **by digest, never by tag**. |
 
 ---
 

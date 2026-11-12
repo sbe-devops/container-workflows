@@ -8,6 +8,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [s
 
 ## [Unreleased]
 
+### Added
+
+- **`docker-release.yml`: `verify_command` and `verify_artifact` inputs.** The caller's own check
+  on the built image, run after the structure tests and before the scan and any push, with
+  `IMAGE` set to the loaded image. It runs inside this workflow, on PR builds too, so a check that
+  needs the image (an MCP engine's `tools/list`, for `mcp-engine-qbo-intuit`) uses the same
+  build, the same base-image pull role and the same job as the release. The command reaches bash
+  through `env`, never through `${{ }}` in the script body.
+- **`docker-release.yml`: `image_digest` output** (and a job-summary line `<repo>@<digest>`). The
+  digest was already signed and attested, but no caller could read it. A host that runs images by
+  digest (ADR-0051's pairing statement) needs it.
+
 ### Fixed
 
 - **`cert-issue.yml`: certbot couldn't write its default paths on a GitHub-hosted runner.**
