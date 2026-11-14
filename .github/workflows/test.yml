@@ -125,10 +125,57 @@ jobs:
 
           echo "✓ certbot ran as the runner user and failed on credentials, which is the correct failure here"
 
+  # docker-release's verify job must hold no credential (PROOF 🔴 on #22: a child reads its
+  # parent's /proc/<pid>/environ, so `env -u` hid nothing). Structure, with 7 mutants:
+  verify-isolation:
+    name: verify job holds no credential (structure)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 tests/verify-isolation.py
+
+  # ...and on a real runner. The CONTROL is the old layout: a job with id-token and an
+  # exported AWS-style secret (what configure-aws-credentials does), whose child strips its
+  # own env and still reads the canary from its parent. It must FIND it.
+  verify-canary-old-layout:
+    name: "control: the old layout leaks through /proc/$PPID/environ"
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: export a credential the way configure-aws-credentials does
+        run: echo "AWS_SECRET_ACCESS_KEY=SBE_CANARY_7f3a" >> "$GITHUB_ENV"
+      - name: the stripped child still finds it
+        run: |
+          env -u AWS_SECRET_ACCESS_KEY -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
+            bash tests/credential-probe.sh found
+
+  # The verify job's own layout: contents: read, no AWS step, no login, no persisted token.
+  # It must find NOTHING anywhere the command could look.
+  verify-canary-verify-layout:
+    name: the verify layout exposes nothing
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash tests/credential-probe.sh none
+
   gate:
     name: gate
     if: always()
-    needs: [shell, certbot]
+    needs: [shell, certbot, verify-isolation, verify-canary-old-layout, verify-canary-verify-layout]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
