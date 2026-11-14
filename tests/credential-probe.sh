@@ -26,6 +26,7 @@ for d in "$HOME/.docker" "${RUNNER_TEMP:-/nonexistent}"; do
   done < <(grep -rlEs "$pat|\"auth\"[[:space:]]*:" "$d")
 done
 [ -d "$HOME/.docker" ] && echo "  (~/.docker holds: $(find "$HOME/.docker" -maxdepth 2 -type f -printf '%P ' 2>/dev/null))"
+[ -f "$HOME/.docker/config.json" ] && echo "  (registries with an auth entry: $(jq -r '(.auths // {}) | to_entries[] | select(.value.auth != null) | .key' "$HOME/.docker/config.json" 2>/dev/null | tr '\n' ' '))"
 [ -f .git/config ] && grep -Eqi 'extraheader|x-access-token' .git/config && report ".git/config holds a token"
 rt=0; for f in /proc/[0-9]*/environ; do [ -r "$f" ] && tr '\0' '\n' < "$f" 2>/dev/null | grep -q '^ACTIONS_RUNTIME_TOKEN=' && rt=$((rt + 1)); done
 echo "  (ACTIONS_RUNTIME_TOKEN readable in $rt process environment(s): artifact access, present in every job)"
