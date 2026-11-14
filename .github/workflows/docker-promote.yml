@@ -32,6 +32,21 @@ jobs:
       id-token: write
       contents: read
     steps:
+      # 🔴 CALLER INPUTS ARE DATA. Every value reaches a script through env: and is quoted,
+      # never pasted into run: with an expression (tests/no-expr-in-run.py fails the build if
+      # one is). image_tag is also held to Docker's tag grammar here, BEFORE any credentialed
+      # step: a tag like `v1$(…)` is refused, not run (PROOF, corp 1a99223).
+      - name: Check caller inputs
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::image_tag is not a valid image tag (letters, digits, _ . -, at most 128, not starting with . or -)"
+            exit 1
+          fi
+          echo "✓ image_tag $IMAGE_TAG"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -39,17 +54,21 @@ jobs:
           aws-region: ${{ inputs.aws_region }}
 
       - name: Promote to latest
+        env:
+          ECR_REPOSITORY_URL: ${{ inputs.ecr_repository_url }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          REPO_NAME=$(echo "${{ inputs.ecr_repository_url }}" | cut -d'/' -f2-)
+          set -euo pipefail
+          REPO_NAME=$(echo "$ECR_REPOSITORY_URL" | cut -d'/' -f2-)
 
           MANIFEST=$(aws ecr batch-get-image \
             --repository-name "$REPO_NAME" \
-            --image-ids imageTag="${{ inputs.image_tag }}" \
+            --image-ids imageTag="$IMAGE_TAG" \
             --query 'images[0].imageManifest' \
             --output text)
 
           if [ -z "$MANIFEST" ] || [ "$MANIFEST" = "None" ]; then
-            echo "ERROR: Tag ${{ inputs.image_tag }} not found in $REPO_NAME"
+            echo "ERROR: Tag $IMAGE_TAG not found in $REPO_NAME"
             exit 1
           fi
 
@@ -58,4 +77,4 @@ jobs:
             --image-tag latest \
             --image-manifest "$MANIFEST"
 
-          echo "✓ Promoted ${{ inputs.image_tag }} → latest in $REPO_NAME"
+          echo "✓ Promoted $IMAGE_TAG → latest in $REPO_NAME"

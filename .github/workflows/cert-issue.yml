@@ -317,6 +317,7 @@ jobs:
         env:
           PARAM: ${{ inputs.ssm_running_image_param }}
           WANT: ${{ steps.issue.outputs.fingerprint }}
+          NOT_AFTER: ${{ steps.issue.outputs.not_after }}
           PRIOR: ${{ steps.prior.outputs.prior_fp }}
           TIMEOUT: ${{ inputs.poll_timeout_seconds }}
           INTERVAL: ${{ inputs.poll_interval_seconds }}
@@ -360,7 +361,7 @@ jobs:
                   echo "| | |"
                   echo "|---|---|"
                   echo "| fingerprint | \`${WANT}\` |"
-                  echo "| expires | ${{ steps.issue.outputs.not_after }} |"
+                  echo "| expires | $NOT_AFTER |"
                   echo "| observed serving after | **${elapsed}s** |"
                   echo ""
                   echo "_Verified against the certificate the server is actually serving, not against liveness._"
