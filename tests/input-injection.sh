@@ -8,6 +8,8 @@
 #   I2 docker-promote "Check caller inputs" does the same;
 #   I3 docker-release "Resolve final image tag" refuses a payload in the extracted version;
 #   I4 a plain tag passes all three (the control that they can pass).
+#   I5 both checks refuse an ecr_repository_url that isn't an ECR repository URL (it reaches
+#      security-actions' sign/attest, which still paste it into run:); real ones pass.
 #   I0 CONTROL: the same "Resolve final image tag" as it stood on main @ 0652165, with the
 #      expression substituted the way GitHub does, EXECUTES the payload. (Skipped with a
 #      notice if that commit isn't in this clone.)
@@ -35,6 +37,7 @@ step "$root/.github/workflows/docker-release.yml" build "Resolve final image tag
 # shellcheck disable=SC2016 # the payloads must NOT expand here; that's the point
 payloads=('v1$(touch PWNED)' 'v1`touch PWNED`' 'v1;touch PWNED' 'v1 && touch PWNED' '-v1' $'v1\ntouch PWNED' "$(printf 'v%.0s' {1..129})")
 cd "$work" || exit 2
+export ECR_REPOSITORY_URL=112401921630.dkr.ecr.us-east-1.amazonaws.com/csi-golang/golang1-26
 for p in "${payloads[@]}"; do
   for s in dr-check dp-check; do
     rm -f PWNED
@@ -53,6 +56,21 @@ done
 rm -f out
 if SEMVER=3.11.15 IMAGE_TAG=v26.5.0 GITHUB_OUTPUT=out bash dr-final.sh >/dev/null 2>&1 && grep -qx 'image_tag=3.11.15-v26.5.0' out; then
   echo "  ✅ dr-final resolves 3.11.15-v26.5.0 (control)"; else echo "  🔴 dr-final did not resolve 3.11.15-v26.5.0"; fail=1; fi
+
+# shellcheck disable=SC2016 # payloads, deliberately unexpanded
+for u in '112401921630.dkr.ecr.us-east-1.amazonaws.com/x$(touch PWNED)' '112401921630.dkr.ecr.us-east-1.amazonaws.com/x;touch PWNED' \
+         'evil.example.com/x' '112401921630.dkr.ecr.us-east-1.amazonaws.com/x y' ''; do
+  for s in dr-check dp-check; do
+    rm -f PWNED
+    if ECR_REPOSITORY_URL="$u" IMAGE_TAG=v1.2.3 bash "$s.sh" >/dev/null 2>&1 || [ -e PWNED ]; then echo "  🔴 $s accepted or ran repository ${u:0:40}"; fail=1
+    else echo "  ✅ $s refused repository ${u:0:48}"; fi
+  done
+done
+for u in 112401921630.dkr.ecr.us-east-1.amazonaws.com/mcp-engine-qbo-intuit 112401921630.dkr.ecr.us-east-1.amazonaws.com/csi-amazonlinux/amazonlinux-minimal; do
+  for s in dr-check dp-check; do
+    if ECR_REPOSITORY_URL="$u" IMAGE_TAG=v1.2.3 bash "$s.sh" >/dev/null 2>&1; then echo "  ✅ $s passes ${u#*/} (control)"; else echo "  🔴 $s refused ${u#*/}"; fail=1; fi
+  done
+done
 
 # I0: the old step, substituted as GitHub substitutes ${{ }}, runs the payload.
 if git -C "$root" cat-file -e 0652165:.github/workflows/docker-release.yml 2>/dev/null; then

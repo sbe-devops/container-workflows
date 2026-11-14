@@ -16,6 +16,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [s
   - **Fixed:**
     - every value in every workflow here now reaches its script through `env:`, quoted;
     - `image_tag` is held to Docker's tag grammar (`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`) in a first step, before any credentialed step, and so is the resolved tag.
+    - `ecr_repository_url` is held to the ECR shape there too (`<12 digits>.dkr.ecr.<region>.amazonaws.com/<name>`). It reaches security-actions' `sign`/`attest`, which still paste their `image-ref` into `run:` (fixed separately). Every known caller's URL fits: 6 CSI and 6 MTG workflows, checked.
   - **Guards:**
     - **`tests/no-expr-in-run.py`** fails on **any** expression inside `run:` (on `main` @ `0652165`: 16);
     - **`tests/input-injection.sh`** feeds payloads to the steps' own bytes, with the old step as a control that executes them.

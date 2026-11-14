@@ -39,13 +39,21 @@ jobs:
       - name: Check caller inputs
         env:
           IMAGE_TAG: ${{ inputs.image_tag }}
+          ECR_REPOSITORY_URL: ${{ inputs.ecr_repository_url }}
         run: |
           set -euo pipefail
           if ! [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
             echo "::error::image_tag is not a valid image tag (letters, digits, _ . -, at most 128, not starting with . or -)"
             exit 1
           fi
-          echo "✓ image_tag $IMAGE_TAG"
+          # ecr_repository_url reaches security-actions' sign/attest, whose composite steps
+          # still paste their image-ref into run: (sweep, 2026-11-14). Held to the ECR shape
+          # here, so nothing but a registry path can arrive there from this workflow.
+          if ! [[ "$ECR_REPOSITORY_URL" =~ ^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-z0-9][a-z0-9._/-]{0,255}$ ]]; then
+            echo "::error::ecr_repository_url is not an ECR repository URL (<account>.dkr.ecr.<region>.amazonaws.com/<name>)"
+            exit 1
+          fi
+          echo "✓ image_tag $IMAGE_TAG, repository $ECR_REPOSITORY_URL"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
