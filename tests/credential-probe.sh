@@ -18,8 +18,14 @@ for f in /proc/[0-9]*/environ; do
   tr '\0' '\n' < "$f" 2>/dev/null | grep -Eq "$pat" && report "$f (pid $(basename "$(dirname "$f")"), parent is $PPID)"
 done
 for d in "$HOME/.docker" "${RUNNER_TEMP:-/nonexistent}"; do
-  [ -d "$d" ] && grep -rEqs "$pat|\"auth\"[[:space:]]*:" "$d" && report "$d"
+  [ -d "$d" ] || continue
+  # Name the file and the KEY that matched, never a value.
+  while IFS= read -r f; do
+    keys=$(grep -oEs "$pat|\"auth\"[[:space:]]*:|\"credsStore\"|\"credHelpers\"" "$f" | sed 's/=.*/=/' | sort -u | tr '\n' ' ')
+    report "$f: $keys"
+  done < <(grep -rlEs "$pat|\"auth\"[[:space:]]*:" "$d")
 done
+[ -d "$HOME/.docker" ] && echo "  (~/.docker holds: $(find "$HOME/.docker" -maxdepth 2 -type f -printf '%P ' 2>/dev/null))"
 [ -f .git/config ] && grep -Eqi 'extraheader|x-access-token' .git/config && report ".git/config holds a token"
 rt=0; for f in /proc/[0-9]*/environ; do [ -r "$f" ] && tr '\0' '\n' < "$f" 2>/dev/null | grep -q '^ACTIONS_RUNTIME_TOKEN=' && rt=$((rt + 1)); done
 echo "  (ACTIONS_RUNTIME_TOKEN readable in $rt process environment(s): artifact access, present in every job)"
