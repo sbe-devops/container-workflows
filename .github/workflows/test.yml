@@ -170,6 +170,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The same step as docker-release's verify job (tests/verify-isolation.py V6).
+      # GitHub-hosted runners ship a Docker Hub login in ~/.docker/config.json: an auth entry
+      # for https://index.docker.io/v1/, in every job, including this one (measured on #22,
+      # tests/credential-probe.sh). This job pulls nothing (the image arrives as a file), so
+      # the file goes before any caller code runs.
+      - name: Drop the runner's preset registry login
+        run: |
+          set -euo pipefail
+          rm -f "$HOME/.docker/config.json"
+          [ ! -e "$HOME/.docker/config.json" ]
+          echo "✓ no registry login on this runner"
+
       - run: bash tests/credential-probe.sh none
 
   gate:

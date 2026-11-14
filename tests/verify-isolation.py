@@ -9,6 +9,8 @@ OIDC token-request pair. The fix is structural, and this checks the structure:
   V3 no other job's step runs inputs.verify_command;
   V4 `push` needs `verify`, and the build job's push steps are off when verify_command is set;
   V5 `push` binds to the tested manifest before signing.
+  V6 `verify` removes the runner's preset ~/.docker/config.json before the caller's command
+     (GitHub-hosted runners ship a Docker Hub login there).
 Then each property is broken in a copy, and each break must be caught.
 
 Run: python3 tests/verify-isolation.py
@@ -43,6 +45,10 @@ def problems(doc):
             out.append("V2 verify's checkout persists its token")
         if "ecr" in str(s.get("run", "")).lower() and "login" in str(s.get("run", "")).lower():
             out.append("V2 verify logs in to a registry")
+    vnames = [s.get("name") for s in steps(v)]
+    drop = [i for i, s in enumerate(steps(v)) if 'rm -f "$HOME/.docker/config.json"' in str(s.get("run", ""))]
+    if not drop or "Verify (caller's command)" not in vnames or drop[0] > vnames.index("Verify (caller's command)"):
+        out.append("V6 verify does not remove ~/.docker/config.json before the caller's command")
     for name, job in jobs.items():
         if name == "verify":
             continue
@@ -68,7 +74,7 @@ def main():
     if bad:
         print("\n".join("  🔴 " + b for b in bad))
         return 1
-    print("  ✅ V1-V5 hold on docker-release.yml")
+    print("  ✅ V1-V6 hold on docker-release.yml")
 
     def m_idtoken(d): d["jobs"]["verify"]["permissions"]["id-token"] = "write"
     def m_aws(d): d["jobs"]["verify"]["steps"].insert(0, {"uses": "aws-actions/configure-aws-credentials@x"})
@@ -86,8 +92,11 @@ def main():
         st = d["jobs"]["push"]["steps"]
         i = next(k for k, s in enumerate(st) if s.get("name") == "The pushed image is the tested image")
         st.append(st.pop(i))
+    def m_keepdocker(d):
+        d["jobs"]["verify"]["steps"] = [s for s in d["jobs"]["verify"]["steps"]
+                                        if 'rm -f "$HOME/.docker/config.json"' not in str(s.get("run", ""))]
     fail = 0
-    for label, f in [("verify gets id-token", m_idtoken), ("verify gets an AWS step", m_aws),
+    for label, f in [("verify keeps the runner's docker login", m_keepdocker), ("verify gets id-token", m_idtoken), ("verify gets an AWS step", m_aws),
                      ("verify checkout persists its token", m_persist), ("build runs the command", m_inbuild),
                      ("push stops needing verify", m_needs), ("build pushes despite verify", m_buildpush),
                      ("bind moved after sign", m_bindafter)]:
