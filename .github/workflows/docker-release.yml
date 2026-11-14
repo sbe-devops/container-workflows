@@ -174,6 +174,29 @@ jobs:
       tested_id: ${{ steps.save.outputs.image_id }}
       tested_tar_sha256: ${{ steps.save.outputs.sha256 }}
     steps:
+      # 🔴 CALLER INPUTS ARE DATA. Every value reaches a script through env: and is quoted,
+      # never pasted into run: with an expression (tests/no-expr-in-run.py fails the build if
+      # one is). image_tag is also held to Docker's tag grammar here, BEFORE any credentialed
+      # step: a tag like `v1$(…)` is refused, not run (PROOF, corp 1a99223).
+      - name: Check caller inputs
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          ECR_REPOSITORY_URL: ${{ inputs.ecr_repository_url }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::image_tag is not a valid image tag (letters, digits, _ . -, at most 128, not starting with . or -)"
+            exit 1
+          fi
+          # ecr_repository_url reaches security-actions' sign/attest, whose composite steps
+          # still paste their image-ref into run: (sweep, 2026-11-14). Held to the ECR shape
+          # here, so nothing but a registry path can arrive there from this workflow.
+          if ! [[ "$ECR_REPOSITORY_URL" =~ ^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-z0-9][a-z0-9._/-]{0,255}$ ]]; then
+            echo "::error::ecr_repository_url is not an ECR repository URL (<account>.dkr.ecr.<region>.amazonaws.com/<name>)"
+            exit 1
+          fi
+          echo "✓ image_tag $IMAGE_TAG, repository $ECR_REPOSITORY_URL"
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -261,9 +284,16 @@ jobs:
       - name: Extract runtime version
         if: inputs.version_extract_command != ''
         id: runtime_version
+        env:
+          VERSION_EXTRACT_COMMAND: ${{ inputs.version_extract_command }}
+          VERSION_EXTRACT_PATTERN: ${{ inputs.version_extract_pattern }}
         run: |
-          OUTPUT=$(docker run --rm --entrypoint '' "${{ env.TEST_IMAGE }}" ${{ inputs.version_extract_command }} 2>&1)
-          SEMVER=$(echo "$OUTPUT" | grep -oE '${{ inputs.version_extract_pattern }}' | head -1 || true)
+          set -uo pipefail
+          # The command runs INSIDE the image, as argv words: split on whitespace, no glob,
+          # and nothing in it is evaluated by this shell.
+          read -r -a cmd <<< "$VERSION_EXTRACT_COMMAND"
+          OUTPUT=$(docker run --rm --entrypoint '' "$TEST_IMAGE" "${cmd[@]}" 2>&1)
+          SEMVER=$(echo "$OUTPUT" | grep -oE -- "$VERSION_EXTRACT_PATTERN" | head -1 || true)
           if [ -z "$SEMVER" ]; then
             echo "ERROR: could not extract version from: $OUTPUT"
             exit 1
@@ -273,12 +303,18 @@ jobs:
 
       - name: Resolve final image tag
         id: final_tag
+        env:
+          SEMVER: ${{ steps.runtime_version.outputs.semver }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          if [ -n "${{ steps.runtime_version.outputs.semver }}" ]; then
-            echo "image_tag=${{ steps.runtime_version.outputs.semver }}-${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
-          else
-            echo "image_tag=${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          if [ -n "$SEMVER" ]; then final="$SEMVER-$IMAGE_TAG"; else final="$IMAGE_TAG"; fi
+          # The prefix comes from the image's own output: hold the result to the tag grammar too.
+          if ! [[ "$final" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::the resolved tag is not a valid image tag"
+            exit 1
           fi
+          echo "image_tag=$final" >> "$GITHUB_OUTPUT"
           echo "✓ Final tag: $(cat $GITHUB_OUTPUT | grep image_tag | cut -d= -f2)"
 
       - name: Scan image
@@ -309,10 +345,12 @@ jobs:
 
       - name: Run structure tests
         if: inputs.run_tests
+        env:
+          TEST_CONFIG: ${{ inputs.test_config }}
         run: |
           container-structure-test test \
-            --image "${{ env.TEST_IMAGE }}" \
-            --config "${{ inputs.test_config }}"
+            --image "$TEST_IMAGE" \
+            --config "$TEST_CONFIG"
 
       # ── With a verify_command, the caller's code never runs in THIS job ────────────
       # This job holds the release role's AWS session and the OIDC token-request pair, and a

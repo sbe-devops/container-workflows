@@ -184,10 +184,35 @@ jobs:
 
       - run: bash tests/credential-probe.sh none
 
+  # 🔴 Caller inputs are data (PROOF, corp 1a99223). No ${{ }} inside any run: block, in
+  # any workflow here; run against main @ 0652165 it fails (16 findings at the time).
+  no-expr-in-run:
+    name: no expression inside run (every workflow)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 tests/no-expr-in-run.py
+
+  # The input checks and the tag resolution, run on their own bytes with injection payloads,
+  # plus the control: main's old step, substituted as GitHub does, runs the payload.
+  input-injection:
+    name: caller inputs are data (payloads)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: bash tests/input-injection.sh
+
   gate:
     name: gate
     if: always()
-    needs: [shell, certbot, verify-isolation, verify-canary-old-layout, verify-canary-verify-layout]
+    needs: [shell, certbot, verify-isolation, verify-canary-old-layout, verify-canary-verify-layout, no-expr-in-run, input-injection]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
@@ -195,11 +220,13 @@ jobs:
       # added or renamed — and, because it runs with `always()`, can never leave a
       # PR waiting on a check that never arrives.
       - name: Verify no upstream job failed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
           set -euo pipefail
-          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] \
-             || [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
-            echo "::error::a self-test job failed"
-            exit 1
-          fi
+          for r in $RESULTS; do
+            case "$r" in
+              failure|cancelled) echo "::error::a self-test job ended $r (all: $RESULTS)"; exit 1 ;;
+            esac
+          done
           echo "✓ gate open"

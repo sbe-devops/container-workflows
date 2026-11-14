@@ -8,6 +8,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [s
 
 ## [Unreleased]
 
+### Security
+
+- **Caller inputs could run shell in the credentialed jobs** (PROOF, corp `1a99223`).
+  - **The defect:** `image_tag`, `version_extract_command`, `version_extract_pattern`, `test_config` (docker-release) and `image_tag` and `ecr_repository_url` (docker-promote) were pasted into `run:` with `${{ }}`. So a valid-looking tag such as `v1$(…)` ran in the job that holds the push role.
+  - **Who was exposed:** docker-promote's callers pass a free-text `workflow_dispatch` `image_tag` (the CSI `promote.yml`s).
+  - **Fixed:**
+    - every value in every workflow here now reaches its script through `env:`, quoted;
+    - `image_tag` is held to Docker's tag grammar (`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`) in a first step, before any credentialed step, and so is the resolved tag.
+    - `ecr_repository_url` is held to the ECR shape there too (`<12 digits>.dkr.ecr.<region>.amazonaws.com/<name>`). It reaches security-actions' `sign`/`attest`, which still paste their `image-ref` into `run:` (fixed separately). Every known caller's URL fits: 6 CSI and 6 MTG workflows, checked.
+  - **Guards:**
+    - **`tests/no-expr-in-run.py`** fails on **any** expression inside `run:` (on `main` @ `0652165`: 16);
+    - **`tests/input-injection.sh`** feeds payloads to the steps' own bytes, with the old step as a control that executes them.
+  - **⚠️ Behaviour change:** `version_extract_command` is now split into argv words inside the image, and **shell quoting in it is no longer honoured**. All known callers (`python3 --version`, `go version`, `cat /etc/system-release`) are plain words.
+
 ### Added
 
 - **`docker-release.yml`: `verify_command` and `verify_artifact` inputs.** The caller's own check
