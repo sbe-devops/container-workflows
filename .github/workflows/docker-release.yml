@@ -113,6 +113,29 @@ on:
         required: false
         type: string
         default: us-east-1
+      verify_command:
+        description: >
+          Optional shell command, run in the caller's checked-out workspace on the tested image
+          (built, scanned and structure-tested), BEFORE any push. `IMAGE` holds its local ref. A
+          non-zero exit fails the run, so nothing is pushed. For a check that has to run the
+          image itself (e.g. an MCP engine's tools/list) and that a structure test cannot
+          express. Runs on every event, PR builds included. It runs in a SEPARATE job, `verify`,
+          that never holds a credential: no id-token permission, no AWS step, no registry login,
+          no persisted checkout token. The image reaches it as a checksummed file. With it set,
+          the push moves to a third job that rebuilds and must match the tested manifest.
+        required: false
+        type: string
+        default: ""
+      verify_artifact:
+        description: >
+          Optional path (relative to the workspace) that verify_command writes. Uploaded as the
+          artifact `verify-<image_tag>` for 30 days, so a release can quote what was measured.
+          Missing after a successful verify_command fails the job. The artifact name must be
+          unique in the run: a matrix whose legs share image_tag (no version_extract_command)
+          collides, and upload-artifact refuses the second upload.
+        required: false
+        type: string
+        default: ""
     secrets:
       extra_repo_app_private_key:
         description: GitHub App private key for the App identified by extra_repo_app_client_id. Used to mint an installation token in-job for the extra_repo checkout. Not required for public extra_repo.
@@ -121,6 +144,11 @@ on:
       image_tag:
         description: The final image tag pushed to ECR (e.g. "3.11.15-v26.5.0" or the raw image_tag if no version extraction).
         value: ${{ jobs.build.outputs.image_tag }}
+      image_digest:
+        description: >
+          The pushed image's digest (sha256:...), the same one signed and attested. Empty when
+          push is false. Consumers that run an image by digest (never by tag) read it here.
+        value: ${{ jobs.build.outputs.image_digest || jobs.push.outputs.image_digest }}
 
 env:
   TEST_IMAGE: test-image:${{ inputs.image_tag }}
@@ -131,7 +159,7 @@ env:
 
 jobs:
   build:
-    name: ${{ inputs.push && 'Build and Push' || 'Build' }}
+    name: ${{ inputs.push && inputs.verify_command == '' && 'Build and Push' || 'Build' }}
     runs-on: ubuntu-24.04-arm
     # Hang protection, not a budget — build + Trivy scan + SBOM + structure tests + push + sign + attest; observed max 3 min.
     # Without this a stuck job runs to GitHub's 360-minute default.
@@ -141,6 +169,10 @@ jobs:
       contents: read
     outputs:
       image_tag: ${{ steps.final_tag.outputs.image_tag }}
+      image_digest: ${{ steps.push.outputs.digest }}
+      tested_manifest: ${{ fromJSON(steps.build.outputs.metadata)['containerimage.digest'] }}
+      tested_id: ${{ steps.save.outputs.image_id }}
+      tested_tar_sha256: ${{ steps.save.outputs.sha256 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -212,6 +244,7 @@ jobs:
       # input exists so a caller wanting a frozen, bit-reproducible base can turn it off.
       # It does NOT disable the layer cache — it re-resolves FROM refs only.
       - name: Build (load for testing)
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: ${{ inputs.build_context }}
@@ -281,8 +314,43 @@ jobs:
             --image "${{ env.TEST_IMAGE }}" \
             --config "${{ inputs.test_config }}"
 
+      # ── With a verify_command, the caller's code never runs in THIS job ────────────
+      # This job holds the release role's AWS session and the OIDC token-request pair, and a
+      # child process can read them from its parent's /proc/<pid>/environ whatever `env -u`
+      # removed from its own (PROOF measured it on #22). So the tested image leaves this job
+      # as a file, checksummed, and the caller's command runs in `verify`, a job with no
+      # id-token permission, no AWS step and no registry login.
+      - name: Save the tested image for the verify job
+        if: inputs.verify_command != ''
+        id: save
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/tested-image"
+          mkdir -p "$out"
+          docker save "$TEST_IMAGE" -o "$out/image.tar"
+          echo "image_id=$(docker image inspect --format '{{.Id}}' "$TEST_IMAGE")" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$out/image.tar" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the tested image
+        if: inputs.verify_command != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tested-image-${{ steps.final_tag.outputs.image_tag }}
+          path: ${{ runner.temp }}/tested-image/image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the SBOM for the push job
+        if: inputs.verify_command != '' && inputs.push && inputs.sbom
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ steps.final_tag.outputs.image_tag }}
+          path: ${{ steps.sbom.outputs.sbom-file }}
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Push to ECR
-        if: inputs.push
+        if: (inputs.push) && inputs.verify_command == ''
         id: push
         uses: docker/build-push-action@v7
         with:
@@ -299,6 +367,261 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The push is a SECOND build. It equals the tested build only on a full cache hit with
+      # an unmoved base. Before anything is signed, check that the pushed linux/arm64
+      # manifest IS the one that was tested, scanned and verified: equal manifest digests
+      # mean the same config and layers. (buildx 0.30's metadata carries containerimage.digest
+      # and .descriptor, not a config digest: measured, #22.)
+      - name: The pushed image is the tested image
+        if: (inputs.push) && inputs.verify_command == ''
+        env:
+          REPO_URL: ${{ inputs.ecr_repository_url }}
+          TESTED: ${{ fromJSON(steps.build.outputs.metadata)['containerimage.digest'] }}
+          PUSHED: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for d in "$TESTED" "$PUSHED"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::not a digest: '$d' (tested '$TESTED', pushed '$PUSHED')"; exit 1; }
+          done
+          # An index (provenance on, the default) names its linux/arm64 manifest; a bare
+          # manifest is itself.
+          child="$(docker buildx imagetools inspect --raw "${REPO_URL}@${PUSHED}" | jq -r --arg self "$PUSHED" '
+            if .manifests then [.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest]
+            else [$self] end | if length == 1 then .[0] else error("expected one linux/arm64 manifest, found \(length)") end')"
+          if [ "$child" != "$TESTED" ]; then
+            echo "::error::the pushed linux/arm64 manifest $child is NOT the tested one $TESTED: the second build differed (base moved or a cache miss). Nothing was signed; re-cut the release."
+            exit 1
+          fi
+          echo "✓ pushed ${REPO_URL}@${PUSHED} carries the tested manifest $TESTED"
+
+      - name: Sign image
+        if: (inputs.push && inputs.sign) && inputs.verify_command == ''
+        uses: sbe-devops/security-actions/.github/actions/sign@v0.4.0
+        with:
+          image-ref: ${{ inputs.ecr_repository_url }}@${{ steps.push.outputs.digest }}
+
+      - name: Attest SBOM
+        if: (inputs.push && inputs.sbom) && inputs.verify_command == ''
+        uses: sbe-devops/security-actions/.github/actions/attest@v0.4.0
+        with:
+          image-ref: ${{ inputs.ecr_repository_url }}@${{ steps.push.outputs.digest }}
+          sbom-file: ${{ steps.sbom.outputs.sbom-file }}
+
+      - name: Record the digest
+        if: (inputs.push) && inputs.verify_command == ''
+        env:
+          REPO_URL: ${{ inputs.ecr_repository_url }}
+          TAG: ${{ steps.final_tag.outputs.image_tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          case "$DIGEST" in
+            sha256:*) ;;
+            *) echo "::error::the push returned no sha256 digest ('$DIGEST')"; exit 1 ;;
+          esac
+          {
+            echo "### Pushed"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| tag | \`${REPO_URL}:${TAG}\` |"
+            echo "| digest | \`${REPO_URL}@${DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The caller's own check on the tested image, in a job that holds NO credential: no
+  # id-token permission (so no ACTIONS_ID_TOKEN_REQUEST_*), no AWS step, no registry login,
+  # and a checkout that keeps no token. It sees the image only as the file `build` saved,
+  # checked against that job's sha256 and image id before anything runs.
+  verify:
+    name: Verify (no credentials)
+    needs: build
+    if: inputs.verify_command != ''
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # GitHub-hosted runners ship a Docker Hub login in ~/.docker/config.json: an auth entry
+      # for https://index.docker.io/v1/, in every job, including this one (measured on #22,
+      # tests/credential-probe.sh). This job pulls nothing (the image arrives as a file), so
+      # the file goes before any caller code runs.
+      - name: Drop the runner's preset registry login
+        run: |
+          set -euo pipefail
+          rm -f "$HOME/.docker/config.json"
+          [ ! -e "$HOME/.docker/config.json" ]
+          echo "✓ no registry login on this runner"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the tested image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tested-image-${{ needs.build.outputs.image_tag }}
+          path: ${{ runner.temp }}/tested-image
+
+      - name: Load it, and check it is the tested image
+        env:
+          WANT_SHA256: ${{ needs.build.outputs.tested_tar_sha256 }}
+          WANT_ID: ${{ needs.build.outputs.tested_id }}
+        run: |
+          set -euo pipefail
+          tar="$RUNNER_TEMP/tested-image/image.tar"
+          got="$(sha256sum "$tar" | cut -d' ' -f1)"
+          [ "$got" = "$WANT_SHA256" ] || { echo "::error::the image file's sha256 is $got, build saved $WANT_SHA256"; exit 1; }
+          docker load -i "$tar"
+          id="$(docker image inspect --format '{{.Id}}' "$TEST_IMAGE")"
+          [ "$id" = "$WANT_ID" ] || { echo "::error::loaded image id $id, build tested $WANT_ID"; exit 1; }
+          echo "✓ $TEST_IMAGE is the tested image ($id)"
+
+      # The caller's own check on the tested image. The command reaches bash through env,
+      # never through ${{ }} in the script body, so its text is data to the shell. There is
+      # nothing to strip from its environment: this job never held a credential.
+      - name: Verify (caller's command)
+        env:
+          IMAGE: ${{ env.TEST_IMAGE }}
+          VERIFY_COMMAND: ${{ inputs.verify_command }}
+          VERIFY_ARTIFACT: ${{ inputs.verify_artifact }}
+        run: |
+          set -euo pipefail
+          bash -euo pipefail -c "$VERIFY_COMMAND"
+          if [ -n "$VERIFY_ARTIFACT" ] && [ ! -s "$VERIFY_ARTIFACT" ]; then
+            echo "::error::verify_command succeeded but did not write verify_artifact '$VERIFY_ARTIFACT'"
+            exit 1
+          fi
+
+      - name: Upload verify artifact
+        if: inputs.verify_artifact != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verify-${{ needs.build.outputs.image_tag }}
+          path: ${{ inputs.verify_artifact }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # With a verify_command, the push waits for `verify` and REBUILDS (the tested image never
+  # holds a credential-bearing job's attention again). "The pushed image is the tested image"
+  # then binds this build to the one `build` tested, before anything is signed.
+  push:
+    name: Push
+    needs: [build, verify]
+    if: inputs.push && inputs.verify_command != '' && needs.verify.result == 'success'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Mint extra_repo token
+        if: inputs.extra_repo != '' && inputs.extra_repo_app_client_id != ''
+        id: extra_repo_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.extra_repo_app_client_id }}
+          private-key: ${{ secrets.extra_repo_app_private_key }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout extra repo
+        if: inputs.extra_repo != ''
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.extra_repo }}
+          ref: ${{ inputs.extra_repo_ref }}
+          path: ${{ inputs.extra_repo_path }}
+          token: ${{ steps.extra_repo_token.outputs.token || github.token }}
+
+      - name: Configure AWS credentials (base image registry)
+        if: inputs.base_image_role_arn != ''
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.base_image_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to base image ECR
+        if: inputs.base_image_role_arn != ''
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Push to ECR
+        if: inputs.push
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          # Both steps, not just the tested one. This is the build whose output ships;
+          # if only the test build re-resolved, the PUSHED image could still carry a
+          # stale base — the worse half of the same defect.
+          pull: ${{ inputs.pull }}
+          tags: ${{ inputs.ecr_repository_url }}:${{ needs.build.outputs.image_tag }}
+          build-args: ${{ inputs.build_args }}
+          platforms: linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The push is a SECOND build. It equals the tested build only on a full cache hit with
+      # an unmoved base. Before anything is signed, check that the pushed linux/arm64
+      # manifest IS the one that was tested, scanned and verified: equal manifest digests
+      # mean the same config and layers. (buildx 0.30's metadata carries containerimage.digest
+      # and .descriptor, not a config digest: measured, #22.)
+      - name: The pushed image is the tested image
+        if: inputs.push
+        env:
+          REPO_URL: ${{ inputs.ecr_repository_url }}
+          TESTED: ${{ needs.build.outputs.tested_manifest }}
+          PUSHED: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for d in "$TESTED" "$PUSHED"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::not a digest: '$d' (tested '$TESTED', pushed '$PUSHED')"; exit 1; }
+          done
+          # An index (provenance on, the default) names its linux/arm64 manifest; a bare
+          # manifest is itself.
+          child="$(docker buildx imagetools inspect --raw "${REPO_URL}@${PUSHED}" | jq -r --arg self "$PUSHED" '
+            if .manifests then [.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest]
+            else [$self] end | if length == 1 then .[0] else error("expected one linux/arm64 manifest, found \(length)") end')"
+          if [ "$child" != "$TESTED" ]; then
+            echo "::error::the pushed linux/arm64 manifest $child is NOT the tested one $TESTED: the second build differed (base moved or a cache miss). Nothing was signed; re-cut the release."
+            exit 1
+          fi
+          echo "✓ pushed ${REPO_URL}@${PUSHED} carries the tested manifest $TESTED"
+
+      - name: Download the SBOM
+        if: inputs.sbom
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom-${{ needs.build.outputs.image_tag }}
+          path: ${{ runner.temp }}/sbom
+
+      - name: Locate the SBOM
+        if: inputs.sbom
+        id: sbom_file
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find "$RUNNER_TEMP/sbom" -type f)
+          [ "${#files[@]}" -eq 1 ] || { echo "::error::expected one SBOM file, found ${#files[@]}"; exit 1; }
+          echo "path=${files[0]}" >> "$GITHUB_OUTPUT"
+
       - name: Sign image
         if: inputs.push && inputs.sign
         uses: sbe-devops/security-actions/.github/actions/sign@v0.4.0
@@ -310,4 +633,25 @@ jobs:
         uses: sbe-devops/security-actions/.github/actions/attest@v0.4.0
         with:
           image-ref: ${{ inputs.ecr_repository_url }}@${{ steps.push.outputs.digest }}
-          sbom-file: ${{ steps.sbom.outputs.sbom-file }}
+          sbom-file: ${{ steps.sbom_file.outputs.path }}
+
+      - name: Record the digest
+        if: inputs.push
+        env:
+          REPO_URL: ${{ inputs.ecr_repository_url }}
+          TAG: ${{ needs.build.outputs.image_tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          case "$DIGEST" in
+            sha256:*) ;;
+            *) echo "::error::the push returned no sha256 digest ('$DIGEST')"; exit 1 ;;
+          esac
+          {
+            echo "### Pushed"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| tag | \`${REPO_URL}:${TAG}\` |"
+            echo "| digest | \`${REPO_URL}@${DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

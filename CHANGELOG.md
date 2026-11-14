@@ -8,6 +8,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [s
 
 ## [Unreleased]
 
+### Added
+
+- **`docker-release.yml`: `verify_command` and `verify_artifact` inputs.** The caller's own check
+  on the built image, run after the structure tests and before the scan and any push, with
+  `IMAGE` set to the loaded image. It runs inside this workflow, on PR builds too, so a check that
+  needs the image (an MCP engine's `tools/list`, for `mcp-engine-qbo-intuit`) runs on the
+  tested image. **It runs in its own job, `verify`, which never holds a credential:** no
+  `id-token` permission, no AWS step, no registry login, and no persisted checkout token. The
+  image reaches it as a `docker save` file, checked against the build job's sha256 and image
+  id. *(An earlier revision ran it in the build job with `env -u`. PROOF showed the child read
+  the session from its parent's `/proc/<pid>/environ`, so stripping hid nothing.)* The command
+  reaches bash through `env`, never through `${{ }}`. With `verify_command` set, the push
+  moves to a third job, `push`, after `verify`. Callers without it keep the single job,
+  unchanged.
+- **`docker-release.yml`: the pushed image must be the tested image.** The push is a second
+  build, and it equals the tested one only on a full cache hit with an unmoved base. A new step
+  between the push and signing compares the pushed `linux/arm64` manifest digest with the
+  tested build's. On a mismatch it fails, and **nothing is signed**. *(This step runs on every
+  `push: true` call, not only verify callers: a release whose second build differs now fails
+  instead of shipping bytes nothing scanned.)*
+- **`docker-release.yml`: `image_digest` output** (and a job-summary line `<repo>@<digest>`). The
+  digest was already signed and attested, but no caller could read it. A host that runs images by
+  digest (ADR-0051's pairing statement) needs it.
+
 ### Fixed
 
 - **`cert-issue.yml`: certbot couldn't write its default paths on a GitHub-hosted runner.**
