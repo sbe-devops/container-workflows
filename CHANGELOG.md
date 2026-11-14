@@ -10,6 +10,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [s
 
 ### Security
 
+- **security-actions `v0.4.0` → `v0.4.1`** (all 10 pins: docker-release's `scan`, `sbom`, `sign` ×2, `attest` ×2; image-mirror's `scan`, `sbom`, `sign`, `attest`).
+  - **v0.4.1** is security-actions#5: `sign`/`attest` take their inputs through `env:`, and refuse an `image-ref` that isn't `<registry>/<repository>@sha256:<64 hex>` before cosign is installed.
+  - **Every call here already passes `<ecr_repository_url>@<digest>`.** image-mirror doesn't check `ecr_repository_url` itself, so v0.4.1's `image-ref` check is now what holds it at the sink.
+
+### Security
+
 - **Caller inputs could run shell in the credentialed jobs** (PROOF, corp `1a99223`).
   - **The defect:** `image_tag`, `version_extract_command`, `version_extract_pattern`, `test_config` (docker-release) and `image_tag` and `ecr_repository_url` (docker-promote) were pasted into `run:` with `${{ }}`. So a valid-looking tag such as `v1$(…)` ran in the job that holds the push role.
   - **Who was exposed:** docker-promote's callers pass a free-text `workflow_dispatch` `image_tag` (the CSI `promote.yml`s).
