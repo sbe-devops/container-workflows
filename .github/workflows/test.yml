@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # A syntax error in an embedded `run:` block is invisible until the step
       # executes — which, for a workflow_call-only repo, means invisible until a
@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # THE REGRESSION TEST. cert-issue.yml shipped defaulting to certbot's
       # /etc/letsencrypt, /var/lib/letsencrypt and /var/log/letsencrypt — all
@@ -209,10 +209,26 @@ jobs:
           fetch-depth: 0
       - run: bash tests/input-injection.sh
 
+  # Every `uses:` is pinned to something that can't move: a third-party action by commit SHA
+  # (with its version in a comment), SBE's own by an exact release tag. Against main @
+  # 7dde501 it fails (27 floating third-party refs).
+  pins:
+    name: every action is pinned
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The matcher refuses what it should (self-test)
+        run: python3 tests/pins.py --self-test
+      - name: Every uses is pinned
+        run: python3 tests/pins.py .
+
   gate:
     name: gate
     if: always()
-    needs: [shell, certbot, verify-isolation, verify-canary-old-layout, verify-canary-verify-layout, no-expr-in-run, input-injection]
+    needs: [shell, certbot, verify-isolation, verify-canary-old-layout, verify-canary-verify-layout, no-expr-in-run, input-injection, pins]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
