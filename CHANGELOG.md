@@ -10,6 +10,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [s
 
 ### Security
 
+- **Every third-party action is pinned by commit SHA** (27 refs: 19 in docker-release, plus docker-deploy, docker-promote, image-mirror, release-drafter and test). Each was pinned at the commit its floating major tag pointed at on 2026-11-20, so nothing changes version: checkout v6.1.0 and v5.1.0, create-github-app-token v3.4.0, configure-aws-credentials v6.3.0, amazon-ecr-login v2.2.0, setup-buildx-action v4.4.1, build-push-action v7.4.0, release-drafter v7.11.0. docker-release runs these in its credentialed jobs, where a moved tag ran new code beside the push role.
+  - **A new `pins` self-test job** fails on any `uses:` that can move: a floating tag, a branch, a short SHA, a SHA without a `# vX.Y.Z` comment, or an SBE ref that isn't an exact release tag. SBE's own actions stay on tags, because the org ruleset `org-release-tags-immutable` forbids moving a `v*` tag. Against main it reports exactly the 27 refs.
 - **security-actions `v0.4.0` → `v0.4.1`** (all 10 pins: docker-release's `scan`, `sbom`, `sign` ×2, `attest` ×2; image-mirror's `scan`, `sbom`, `sign`, `attest`).
   - **v0.4.1** is security-actions#5: `sign`/`attest` take their inputs through `env:`, and refuse an `image-ref` that isn't `<registry>/<repository>@sha256:<64 hex>` before cosign is installed.
   - **Every call here already passes `<ecr_repository_url>@<digest>`.** image-mirror doesn't check `ecr_repository_url` itself, so v0.4.1's `image-ref` check is now what holds it at the sink.
