@@ -215,18 +215,41 @@ jobs:
     needs: [shell, certbot, verify-isolation, verify-canary-old-layout, verify-canary-verify-layout, no-expr-in-run, input-injection]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       # Aggregate, so branch protection names ONE check that survives jobs being
       # added or renamed — and, because it runs with `always()`, can never leave a
       # PR waiting on a check that never arrives.
-      - name: Verify no upstream job failed
+      # Strict (security-actions#7/#9 shape, PROOF 2026-11-20): every job above must be in
+      # `needs`, and every one must end `success`. The old check passed `skipped` and an empty
+      # result, so a job skipped by a bad `if:`, or left out of needs, was a green gate.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/workflows/test.yml
+          sparse-checkout-cone-mode: false
+      - name: every job is in needs
         env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
+          NEEDS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-          for r in $RESULTS; do
-            case "$r" in
-              failure|cancelled) echo "::error::a self-test job ended $r (all: $RESULTS)"; exit 1 ;;
-            esac
-          done
-          echo "✓ gate open"
+          want="$(yq '.jobs | keys | .[] | select(. != "gate")' .github/workflows/test.yml | sort)"
+          got="$(jq -r 'keys[]' <<<"$NEEDS" | sort)"
+          [ -n "$want" ] || { echo "::error::read no jobs from test.yml"; exit 1; }
+          if [ "$want" != "$got" ]; then
+            echo "::error::gate's needs must list every other job in test.yml"
+            diff <(echo "$want") <(echo "$got") || true
+            exit 1
+          fi
+          echo "✓ needs = every job in test.yml but gate ($(tr '\n' ' ' <<<"$got"))"
+      - name: every job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          results="$(jq -r 'to_entries | map("\(.key)=\(.value.result)") | join(" ")' <<<"$NEEDS")"
+          [ -n "$results" ] || { echo "::error::gate needs no job: nothing is gated"; exit 1; }
+          bad="$(jq -r 'to_entries | map(select(.value.result != "success")) | map(.key) | join(" ")' <<<"$NEEDS")"
+          [ -z "$bad" ] || { echo "::error::not success: $bad ($results)"; exit 1; }
+          echo "✓ gate open ($results)"
