@@ -209,10 +209,25 @@ jobs:
           fetch-depth: 0
       - run: bash tests/input-injection.sh
 
+  # The shared gate (security-actions workflow-lint): no ${{ }} pasted into anything that runs
+  # (run:, script:, shell:, container options, docker:// args), by zizmor template-injection at
+  # every severity, actionlint's [expression] findings, and lint.py for the sinks neither covers.
+  # The same action in every workflow repo; no-expr-in-run above is this repo's older, narrower
+  # check, kept until the shared one has run here for a while.
+  workflow-lint:
+    name: workflow-lint (shared gate)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: sbe-devops/security-actions/.github/actions/workflow-lint@v0.5.0
+
   gate:
     name: gate
     if: always()
-    needs: [shell, certbot, verify-isolation, verify-canary-old-layout, verify-canary-verify-layout, no-expr-in-run, input-injection]
+    needs: [shell, certbot, verify-isolation, verify-canary-old-layout, verify-canary-verify-layout, no-expr-in-run, input-injection, workflow-lint]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     permissions:
